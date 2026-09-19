@@ -130,13 +130,16 @@ def test_friendly_media_error_mapping():
     assert _friendly_media_error(Exception("其他错误")) == "其他错误"
 
 
-def test_collect_native_libs_macos_probe():
-    """非 Windows 平台运行收集脚本：探测 av 正常即 exit 0。"""
+def test_collect_native_libs_probe(qapp, isolated_settings):
+    """收集脚本探测：非 Windows 平台 av 正常即 exit 0（CI Windows 分支另行验证）。"""
     import subprocess
     import sys
-    r = subprocess.run(
-        [sys.executable, "tools/collect_native_libs.py",
-         os.path.join(os.path.dirname(__file__), "_tmp_libs")],
-        capture_output=True, text=True)
-    assert r.returncode == 0
+    from pathlib import Path
+    # 绝对路径定位脚本，不依赖 pytest 的启动目录（CI 上曾因相对路径踩坑）
+    script = Path(__file__).resolve().parent.parent / "tools" / "collect_native_libs.py"
+    assert script.is_file(), f"收集脚本缺失，请确认 tools/ 目录已提交：{script}"
+    out_dir = Path(__file__).resolve().parent / "_tmp_libs"
+    r = subprocess.run([sys.executable, str(script), str(out_dir)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
     assert "PyAV" in r.stdout

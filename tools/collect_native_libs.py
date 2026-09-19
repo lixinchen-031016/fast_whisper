@@ -42,7 +42,8 @@ def _pkg_dir(module_name: str):
 def _collect(src_dir: str, patterns: list, out_dir: str) -> int:
     copied = 0
     for pattern in patterns:
-        for src in glob.glob(os.path.join(src_dir, pattern)):
+        # recursive=True：支持 ** 深层匹配（如 lib*/**/*.dll）
+        for src in glob.glob(os.path.join(src_dir, pattern), recursive=True):
             dest = os.path.join(out_dir, os.path.basename(src))
             shutil.copy2(src, dest)
             copied += 1
@@ -57,13 +58,19 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # ---- PyAV 内置 FFmpeg（必需：视频转写的解码引擎） ----
-    # Windows：FFmpeg DLL 与 av.pyd 同级，必须显式收集（否则报"缺少 FFmpeg"）
+    # Windows：新版轮子（PyAV ≥13，delvewheel 修补）把带哈希后缀的 FFmpeg DLL
+    # 放在与 av/ 平级的 av.libs/ 顶层目录；旧版在 av/ 顶层——两处都收集；
     # macOS/Linux：av/.dylibs 由 hooks-contrib 的 av 钩子处理，此处仅探测报告
     is_windows = sys.platform == "win32"
     av_dir = _pkg_dir("av")
     if is_windows:
-        av_dlls = _collect(av_dir, ["*.dll"], out_dir) if av_dir else 0
-        print(f"PyAV 内置 FFmpeg：收集 {av_dlls} 个原生库（av/ 目录内嵌轮子）")
+        av_dlls = 0
+        if av_dir:
+            av_dlls += _collect(av_dir, ["*.dll"], out_dir)             # 旧版布局
+            libs_dir = os.path.join(os.path.dirname(av_dir), "av.libs")
+            if os.path.isdir(libs_dir):
+                av_dlls += _collect(libs_dir, ["*.dll"], out_dir)       # 新版布局
+        print(f"PyAV 内置 FFmpeg：收集 {av_dlls} 个原生库（av/ 与 av.libs/）")
         if av_dir is None or av_dlls == 0:
             print("错误：未找到 PyAV 的 FFmpeg 原生库，视频转写将不可用，构建终止")
             sys.exit(1)
