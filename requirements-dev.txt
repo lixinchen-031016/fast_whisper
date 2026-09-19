@@ -1,0 +1,2 @@
+# 开发/CI 依赖：-r requirements.txt 之外追加
+pytest>=8.0

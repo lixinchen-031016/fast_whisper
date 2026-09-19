@@ -7,11 +7,11 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QDialog,
-    QHeaderView, QMessageBox, QAbstractItemView,
+    QHeaderView, QMessageBox, QAbstractItemView, QComboBox,
 )
 
 from . import model_manager
-from .theme import ACCENT, BORDER, CARD, DANGER, TEXT, TEXT_SECOND
+from .theme import ACCENT, BORDER, TEXT, TEXT_SECOND
 
 
 class Card(QFrame):
@@ -104,18 +104,34 @@ class DropArea(QFrame):
 
 
 class ModelSearchDialog(QDialog):
-    """模型搜索与下载对话框（走国内镜像站 hf-mirror.com）。"""
+    """模型搜索与下载对话框（走国内镜像站 hf-mirror.com）。
+
+    按引擎架构过滤结果：cpu/cuda 只显示 CTranslate2 格式，mlx 只显示 MLX 格式。
+    """
     downloadFinished = Signal(str, str)   # repo_id, local_dir
 
-    def __init__(self, parent=None):
+    def __init__(self, engine: str = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("搜索并下载模型 — hf-mirror.com")
-        self.resize(720, 520)
+        self.resize(720, 560)
         self._worker = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
         lay.setSpacing(12)
+
+        # 架构选择行：决定搜索过滤方向
+        arch_row = QHBoxLayout()
+        arch_row.addWidget(QLabel("模型架构："))
+        self.arch_combo = QComboBox()
+        self.arch_combo.addItem("CPU / NVIDIA GPU（CTranslate2 格式）", "cpu")
+        self.arch_combo.addItem("Apple Metal（MLX 格式）", "mlx")
+        # 按主窗口传入的引擎预选架构
+        if engine == "mlx":
+            self.arch_combo.setCurrentIndex(1)
+        self.arch_combo.currentIndexChanged.connect(self._on_arch_changed)
+        arch_row.addWidget(self.arch_combo, 1)
+        lay.addLayout(arch_row)
 
         search_row = QHBoxLayout()
         self.search_edit = QLineEdit()
@@ -142,7 +158,7 @@ class ModelSearchDialog(QDialog):
         self.progress.setRange(0, 100)
         lay.addWidget(self.progress)
 
-        self.status_label = QLabel("提示：优先选择名称含 faster-whisper 的 CTranslate2 格式模型")
+        self.status_label = QLabel("提示：搜索结果已按所选架构过滤——CPU/NVIDIA 选 CTranslate2 格式，Apple 选 MLX 格式")
         self.status_label.setStyleSheet(f"color: {TEXT_SECOND}; font-size: 12px;")
         lay.addWidget(self.status_label)
 
@@ -164,21 +180,37 @@ class ModelSearchDialog(QDialog):
         self.download_btn.clicked.connect(self.do_download)
         self.cancel_btn.clicked.connect(self._cancel_download)
         self.close_btn.clicked.connect(self.reject)
-        self.search_edit.setText("faster-whisper")
+        self.search_edit.setText(self._default_query())
+
+    def _arch_kind(self) -> str:
+        """对话框内的架构选择映射为引擎 kind：cpu/cuda → cpu 项；mlx → mlx 项。"""
+        return self.arch_combo.currentData()
+
+    def _default_query(self) -> str:
+        return "mlx whisper" if self._arch_kind() == "mlx" else "faster-whisper"
+
+    def _on_arch_changed(self):
+        self.search_edit.setText(self._default_query())
+        self.table.setRowCount(0)
 
     # ----- 搜索 -----
     def do_search(self):
         query = self.search_edit.text().strip() or "whisper"
-        self.status_label.setText(f"正在搜索“{query}”…")
+        arch = self._arch_kind()
+        # mlx 架构在搜索 API 层面用 mlx 过滤，cpu 架构沿用原关键词并后置过滤
+        api_query = query if arch != "mlx" else f"{query} mlx" if "mlx" not in query.lower() else query
+        self.status_label.setText(f"正在搜索“{api_query}”…")
         self.search_btn.setEnabled(False)
         try:
-            results = model_manager.search_models(query)
+            results = model_manager.search_models(api_query, engine=arch)
         except Exception as e:
             self.status_label.setText(f"搜索失败：{e}（请检查网络）")
             self.search_btn.setEnabled(True)
             return
         self.search_btn.setEnabled(True)
-        self.status_label.setText(f"找到 {len(results)} 个模型（按下载量排序，优先 CTranslate2 格式）")
+        fmt = "MLX" if arch == "mlx" else "CTranslate2"
+        self.status_label.setText(
+            f"找到 {len(results)} 个模型（按下载量排序，{fmt} 格式优先）")
         self._fill_table(results)
 
     def _fill_table(self, results):
@@ -250,3 +282,78 @@ class ModelSearchDialog(QDialog):
             self._worker.cancel()
             self._worker.wait(2000)
         event.accept()
+
+
+class SettingsDialog(QDialog):
+    """偏好设置对话框：模型存放目录、默认导出目录（持久化保存）。"""
+
+    settingsSaved = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from . import settings
+        self.setWindowTitle("偏好设置")
+        self.resize(640, 240)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 20, 20, 16)
+        lay.setSpacing(12)
+
+        hint = QLabel("设置会立即保存，并在本机所有会话中生效。")
+        hint.setStyleSheet(f"color: {TEXT_SECOND}; font-size: 12px;")
+        lay.addWidget(hint)
+
+        # --- 模型存放目录 ---
+        lay.addWidget(QLabel("模型存放目录"))
+        row1 = QHBoxLayout()
+        self.models_edit = QLineEdit(settings.get_models_dir())
+        self.models_edit.setToolTip("faster-whisper 与 MLX 模型统一存放在此目录下，每个模型一个子目录")
+        btn1 = QPushButton("浏览…")
+        btn1.clicked.connect(lambda: self._browse(self.models_edit))
+        row1.addWidget(self.models_edit, 1)
+        row1.addWidget(btn1)
+        lay.addLayout(row1)
+
+        # --- 默认导出目录 ---
+        lay.addWidget(QLabel("默认导出目录（留空 = 跟随媒体文件所在目录）"))
+        row2 = QHBoxLayout()
+        self.export_edit = QLineEdit(settings.get_export_dir())
+        btn2 = QPushButton("浏览…")
+        btn2.clicked.connect(lambda: self._browse(self.export_edit))
+        row2.addWidget(self.export_edit, 1)
+        row2.addWidget(btn2)
+        lay.addLayout(row2)
+
+        lay.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("恢复默认")
+        reset_btn.clicked.connect(self._reset)
+        save_btn = QPushButton("保存")
+        save_btn.setObjectName("primaryButton")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        save_btn.clicked.connect(self._save)
+        cancel_btn.clicked.connect(self.reject)
+
+    def _browse(self, edit: QLineEdit):
+        path = QFileDialog.getExistingDirectory(self, "选择目录", edit.text() or os.path.expanduser("~"))
+        if path:
+            edit.setText(path)
+
+    def _save(self):
+        from . import settings
+        settings.set_models_dir(self.models_edit.text().strip())
+        settings.set_export_dir(self.export_edit.text().strip())
+        self.settingsSaved.emit()
+        self.accept()
+
+    def _reset(self):
+        from . import settings
+        self.models_edit.setText(settings.default_models_dir())
+        self.export_edit.setText("")

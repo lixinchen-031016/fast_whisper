@@ -43,8 +43,9 @@ class DownloadWorker(QThread):
 class TranscribeWorker(QThread):
     """转写线程：加载模型 → 推理 → 逐段回报。
 
-    engine: "fw"  = faster-whisper（CPU int8，可开批量推理）
-            "mlx" = mlx-whisper（Apple Metal GPU 加速，仅 macOS）
+    engine: "cpu"  = faster-whisper CPU int8（可开批量推理）
+            "cuda" = faster-whisper NVIDIA GPU float16（加载失败自动回退 CPU）
+            "mlx"  = mlx-whisper Apple Metal GPU（仅 macOS）
     """
     model_loading = Signal()
     segment_ready = Signal(float, float, str)   # start, end, text
@@ -53,14 +54,14 @@ class TranscribeWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, media_path: str, model_path: str,
-                 engine: str = "fw",
+                 engine: str = "cpu",
                  language: str = "auto", task: str = "transcribe",
                  beam_size: int = 5, use_vad: bool = True,
                  batched: bool = False, parent=None):
         super().__init__(parent)
         self.media_path = media_path
         self.model_path = model_path
-        self.engine = engine
+        self.engine = engine if engine in ("cpu", "cuda", "mlx") else "cpu"
         self.language = None if language == "auto" else language
         self.task = task
         self.beam_size = beam_size
@@ -77,7 +78,7 @@ class TranscribeWorker(QThread):
         else:
             self._run_fw()
 
-    # ---------- faster-whisper（CPU） ----------
+    # ---------- faster-whisper（CPU / CUDA） ----------
     def _run_fw(self):
         try:
             from faster_whisper import WhisperModel
@@ -85,16 +86,32 @@ class TranscribeWorker(QThread):
             self.failed.emit(f"缺少 faster-whisper：{e}")
             return
 
+        from .config import ENGINES
+        spec = ENGINES.get(self.engine, ENGINES["cpu"])
+        device, compute = spec["device"], spec["compute_type"]
+
         try:
             self.model_loading.emit()
-            self.progress_text.emit("正在加载模型（首次加载需要一些时间）…")
-            # CPU + int8：macOS/Windows 通用，无需 GPU 依赖
-            model = WhisperModel(self.model_path, device="cpu", compute_type="int8")
+            self.progress_text.emit(
+                f"正在加载模型（{spec['label']}，首次加载需要一些时间）…")
+            try:
+                model = WhisperModel(self.model_path,
+                                     device=device, compute_type=compute)
+                self.progress_text.emit(f"已使用 {spec['label']} 推理")
+            except Exception as e:
+                # CUDA 环境不完整（缺 cuBLAS/cuDNN 等）时自动回退 CPU
+                if device == "cuda":
+                    self.progress_text.emit(
+                        f"NVIDIA GPU 加载失败（{e}），已自动回退 CPU 推理")
+                    model = WhisperModel(self.model_path,
+                                         device="cpu", compute_type="int8")
+                else:
+                    raise
 
             self.progress_text.emit(
                 "正在转写（批量模式）…" if self.batched else "正在转写…")
             if self.batched:
-                # 批量推理：VAD 切块后并行解码，CPU 上可再提速（实测约 1.8x）。
+                # 批量推理：VAD 切块后并行解码（CPU 实测约 1.8x）。
                 # 注意其参数集与逐段推理不同，不能混传 condition_on_previous_text 等。
                 from faster_whisper.transcribe import BatchedInferencePipeline
                 runner = BatchedInferencePipeline(model=model)
@@ -130,6 +147,7 @@ class TranscribeWorker(QThread):
                 "duration": info.duration,
                 "language": info.language,
                 "language_probability": round(info.language_probability, 3),
+                "engine": self.engine,
             }
             self.finished_ok.emit(segs, info_obj)
         except Exception as e:
@@ -168,6 +186,7 @@ class TranscribeWorker(QThread):
                 "duration": segs[-1]["end"] if segs else 0,
                 "language": result.get("language", "?"),
                 "language_probability": 0,
+                "engine": "mlx",
             }
             self.finished_ok.emit(segs, info_obj)
         except Exception as e:

@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .config import HF_MIRROR, MODELS_DIR
+from . import settings
+from .config import HF_MIRROR
 
 TIMEOUT = 15
 
@@ -29,9 +30,9 @@ class ModelInfo:
 
     @property
     def local_dir(self) -> str:
-        """对应的本地存放目录。"""
+        """对应的本地存放目录（跟随用户设置，而非固定常量）。"""
         safe = self.repo_id.replace("/", "__")
-        return os.path.join(MODELS_DIR, safe)
+        return os.path.join(settings.get_models_dir(), safe)
 
     @property
     def is_downloaded(self) -> bool:
@@ -45,14 +46,34 @@ def _get(url: str, **kwargs) -> requests.Response:
     return resp
 
 
-def search_models(query: str, limit: int = 30) -> list:
+def filter_by_engine(repo_id: str, engine: str) -> bool:
+    """按引擎架构过滤模型仓库：
+    - cpu/cuda：需要 CTranslate2 格式（faster-whisper / ct2 / ctranslate2），
+      排除 mlx 与 openai/whisper 原始权重（原始格式 faster-whisper 无法加载）
+    - mlx：需要 MLX 格式（仓库名含 mlx，通常为 mlx-community）
+    - None：不过滤
+    """
+    rid = repo_id.lower()
+    if engine in ("cpu", "cuda"):
+        if "mlx" in rid or rid.startswith("openai/whisper"):
+            return False
+        return ("faster-whisper" in rid or "ct2" in rid or "ctranslate2" in rid)
+    if engine == "mlx":
+        return "mlx" in rid
+    return True
+
+
+def search_models(query: str, limit: int = 30, engine: str = None) -> list:
     """在镜像站搜索模型，返回按下载量排序的 ModelInfo 列表。
 
-    自动过滤出 CTranslate2 / faster-whisper 格式的模型（转写引擎所需），
-    若结果不足则原样返回其余 ASR 模型。
+    engine 不为 None 时严格过滤为该架构可用的模型格式：
+    - mlx：限定 author=mlx-community 检索（MLX 格式模型社区仓库）
+    - cpu/cuda：搜索后按 CTranslate2 格式过滤
     """
     url = f"{HF_MIRROR}/api/models"
     params = {"search": query, "limit": limit, "sort": "downloads", "direction": -1}
+    if engine == "mlx" and "community" not in query.lower():
+        params["author"] = "mlx-community"
     data = _get(url, params=params).json()
     results = []
     for item in data:
@@ -67,11 +88,10 @@ def search_models(query: str, limit: int = 30) -> list:
         )
         results.append(info)
 
-    # 优先展示 faster-whisper / ctranslate2 格式
-    preferred = [m for m in results
-                 if "faster-whisper" in m.repo_id.lower() or "ct2" in m.repo_id.lower()]
-    others = [m for m in results if m not in preferred]
-    return preferred + others
+    if engine:
+        # 严格过滤：只保留当前架构可用的模型格式
+        results = [m for m in results if filter_by_engine(m.repo_id, engine)]
+    return results
 
 
 def get_model_files(repo_id: str) -> list:

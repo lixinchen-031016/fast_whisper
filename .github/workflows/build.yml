@@ -1,0 +1,274 @@
+# =============================================================================
+# FastWhisper 语音转文字 — CI/CD 工作流
+# -----------------------------------------------------------------------------
+# 架构分析：
+#   - 类型    : 跨平台桌面应用（PySide6 / Qt GUI），非服务端程序
+#   - 运行时  : Python 3.11+（本地 3.13 验证）
+#   - 技术栈  : PySide6、faster-whisper（CTranslate2）、PyAV、python-docx；
+#              可选引擎 mlx-whisper 仅 macOS 可用，CI 不安装（运行时自动探测降级）
+#   - 测试    : pytest（tests/test_smoke.py：设置持久化 / 引擎过滤 / offscreen
+#              界面构造），QT_QPA_PLATFORM=offscreen，Ubuntu 无需显示器
+#   - 部署目标: 桌面分发产物，统一发布到 GitHub Releases（nightly 滚动预发布
+#              + tag 正式发布），避免每次代码更新都膨胀版本号
+#
+# 触发条件 : 推送 main 分支 / 推送 v* 标签 / 向 main 发起 PR / 手动触发
+# 作业结构 : test →(门禁)→ build-windows / build-macos 并行构建 →(汇合)→ deploy
+# 条件部署 : 仅「推送（main 或 tag）」时执行 deploy，PR 与手动触发不发布
+#
+# 版本策略（避免代码更新后的版本号问题）：
+#   - 日常推送 main → 覆盖式「nightly」预发布（自动删除上一次 nightly，
+#     标题携带 commit 短哈希，可追溯），无需打版本号
+#   - 正式发版     → 推送 v* 标签（如 v1.0.0）→ 正式 Release（非预发布）
+# =============================================================================
+
+name: CI/CD - FastWhisper 语音转文字
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# 同一分支/PR 只保留最新一次运行，取消进行中的旧运行，节省资源
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  APP_NAME: "FastWhisper"
+  PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 0) 测试门禁：设置持久化 / 引擎注册与过滤 / offscreen 界面构造
+  #    - 纯后端 + offscreen 界面测试，Ubuntu 上无需显示器
+  #    - 构建作业依赖本作业，测试不通过则不出包（防止带着回归发版）
+  # ---------------------------------------------------------------------------
+  test:
+    name: 运行测试（pytest）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 安装 Qt 运行库（offscreen 界面测试所需）
+        run: |
+          sudo apt-get update || true
+          # 缺少运行库时测试会直接报「could not load the Qt platform plugin」，
+          # 因此这里不让 apt 的偶发失败阻断流水线，把问题留给明确的测试失败
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
+            || echo "Qt 运行库安装未完成，继续运行测试"
+
+      - name: 运行测试
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
+
+  # ---------------------------------------------------------------------------
+  # 1) 构建 Windows x86_64 单文件 exe
+  #    - PyInstaller 需显式收集 faster-whisper 生态的隐藏依赖：
+  #      ctranslate2（C++ 扩展）、av（自带 FFmpeg 库）、tokenizers（Rust 扩展）、
+  #      onnxruntime（Silero VAD），漏收会在运行时报 ModuleNotFoundError
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: 构建 Windows x86_64 (.exe)
+    needs: test
+    runs-on: windows-latest # GitHub Windows 运行器均为 x86_64（Intel/AMD 64 位）
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 校验 x86_64 架构
+        run: python -c "import platform, sys; print(sys.version); assert platform.machine() in ('AMD64', 'x86_64'), platform.machine()"
+
+      - name: 打包单文件 exe（无控制台窗口）
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name ${{ env.APP_NAME }}
+          --collect-all faster_whisper
+          --collect-all ctranslate2
+          --collect-all tokenizers
+          --collect-all av
+          --collect-all onnxruntime
+          main.py
+
+      - name: 冒烟启动 Windows 应用
+        shell: pwsh
+        run: |
+          # onefile 首次启动需解压运行时（PySide6+ctranslate2 约 150MB），预留 30 秒
+          $process = Start-Process -FilePath "dist\${{ env.APP_NAME }}.exe" -PassThru
+          Start-Sleep -Seconds 30
+          if ($process.HasExited) {
+            throw "${{ env.APP_NAME }}.exe 在启动后提前退出，退出码: $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id -Force
+
+      - name: 上传 Windows 构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/${{ env.APP_NAME }}.exe
+          if-no-files-found: error # .exe 是核心产物，缺失即视为失败
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2) 构建 macOS ARM64 原生产物（.app + .dmg）
+  #    - macos-latest 为 Apple Silicon 运行器，原生 arm64 构建
+  #    - 不安装 mlx-whisper：Metal 引擎为可选组件，应用启动时自动探测降级 CPU
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: 构建 macOS arm64 (.app / .dmg)
+    needs: test
+    runs-on: macos-latest # Apple Silicon 运行器，原生 arm64 构建
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python（原生 arm64）
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 校验 arm64 架构
+        run: python -c "import platform, sys; print(sys.version); assert platform.machine() == 'arm64', platform.machine()"
+
+      - name: 打包 .app（窗口模式）
+        run: >
+          pyinstaller --noconfirm --clean --windowed
+          --name ${{ env.APP_NAME }}
+          --collect-all faster_whisper
+          --collect-all ctranslate2
+          --collect-all tokenizers
+          --collect-all av
+          --collect-all onnxruntime
+          main.py
+
+      - name: 冒烟启动 macOS 应用
+        run: |
+          APP="dist/${{ env.APP_NAME }}.app/Contents/MacOS/${{ env.APP_NAME }}"
+          "$APP" >/tmp/fastwhisper-macos-smoke.log 2>&1 &
+          APP_PID=$!
+          sleep 15
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            cat /tmp/fastwhisper-macos-smoke.log
+            exit 1
+          fi
+          kill "$APP_PID"
+          wait "$APP_PID" || true
+
+      - name: 制作 DMG（含 Applications 拖拽安装）
+        run: |
+          rm -rf dmg && mkdir dmg
+          cp -R "dist/${{ env.APP_NAME }}.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "${{ env.APP_NAME }}" \
+            -srcfolder dmg -ov -format UDZO \
+            "${{ env.APP_NAME }}-macOS-arm64.dmg"
+
+      - name: 上传 macOS 构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: ${{ env.APP_NAME }}-macOS-arm64.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3) 条件部署：仅「推送 main 或 tag」时，发布到 GitHub Releases
+  #    - 推送 v* 标签 → 正式 Release（非预发布）
+  #    - 推送 main   → 滚动 nightly 预发布（覆盖上一次 nightly，标题带 commit 哈希）
+  #    - PR / 手动触发 → 不发布（产物仅在 Artifacts）
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: 发布到 GitHub Releases
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write # 创建 Release 所需
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 Windows 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: artifacts/windows
+
+      - name: 下载 macOS 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: artifacts/macos
+
+      - name: 计算发布元数据
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}"                       >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"                             >> "$GITHUB_OUTPUT"
+            echo "title=FastWhisper 语音转文字 ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=nightly"                                  >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"                              >> "$GITHUB_OUTPUT"
+            echo "title=FastWhisper 语音转文字 nightly (${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+            # 清理上一次 nightly，保持单一滚动预发布（避免版本号膨胀）
+            gh release delete nightly --yes || true
+            git push --delete origin nightly 2>/dev/null || true
+          fi
+
+      - name: 发布到 GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.meta.outputs.title }}" \
+            --generate-notes \
+            $([ "${{ steps.meta.outputs.prerelease }}" = "true" ] && echo "--prerelease") \
+            "artifacts/windows/${{ env.APP_NAME }}.exe" \
+            "artifacts/macos/${{ env.APP_NAME }}-macOS-arm64.dmg"

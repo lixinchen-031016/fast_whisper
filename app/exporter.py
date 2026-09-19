@@ -2,6 +2,12 @@
 # -*- coding: utf-8 -*-
 """转写结果导出：TXT / SRT / Markdown / Word(docx)。"""
 import os
+import sys
+
+
+def _docx_font() -> str:
+    """Word 文档中文字体按平台选择（写死的字体在缺失时会回退默认）。"""
+    return "PingFang SC" if sys.platform == "darwin" else "微软雅黑"
 
 
 def _fmt_ts_srt(seconds: float) -> str:
@@ -53,7 +59,8 @@ def export_docx(segments: list, path: str, title: str = "语音转写稿") -> st
     GRAY = RGBColor(0x7F, 0x7F, 0x7F)
     ACCENT = RGBColor(0x1F, 0x4E, 0x79)
 
-    def set_cn_font(run, name="微软雅黑"):
+    def set_cn_font(run, name=None):
+        name = name or _docx_font()
         run.font.name = name
         run._element.rPr.rFonts.set(qn("w:eastAsia"), name)
 
@@ -77,8 +84,8 @@ def export_docx(segments: list, path: str, title: str = "语音转写稿") -> st
     return path
 
 
-def default_export_path(media_path: str, ext: str) -> str:
-    """默认导出路径：与媒体文件同目录、同名、不同扩展名。"""
+def default_export_path(media_path: str, ext: str, out_dir: str = None) -> str:
+    """默认导出路径：优先用户设置的导出目录，否则与媒体文件同目录、同名。"""
     base = os.path.splitext(os.path.basename(media_path))[0]
-    out_dir = os.path.dirname(media_path) or "."
-    return os.path.join(out_dir, f"{base}_转写稿.{ext}")
+    directory = out_dir or os.path.dirname(media_path) or "."
+    return os.path.join(directory, f"{base}_转写稿.{ext}")

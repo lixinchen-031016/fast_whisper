@@ -11,13 +11,11 @@ from PySide6.QtWidgets import (
     QHeaderView, QAbstractItemView, QCheckBox,
 )
 
-from .config import FW_BUILTIN_MODELS, MEDIA_FILTER, MLX_BUILTIN_MODELS, MODELS_DIR
-from .exporter import (
-    default_export_path, export_docx, export_markdown, export_srt, export_txt,
-)
+from .config import ENGINES, MEDIA_FILTER
+from .exporter import export_docx, export_markdown, export_srt, export_txt
 from .theme import TEXT_SECOND
-from .widgets import Card, DropArea, ModelSearchDialog
-from .workers import TranscribeWorker, list_local_models, local_model_kind, mlx_available
+from .widgets import Card, DropArea, ModelSearchDialog, SettingsDialog
+from .workers import TranscribeWorker, list_local_models, local_model_kind
 
 LANGS = [("自动检测", "auto"), ("中文", "zh"), ("英语", "en"), ("日语", "ja"),
          ("韩语", "ko"), ("德语", "de"), ("法语", "fr"), ("西班牙语", "es")]
@@ -53,11 +51,20 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         t = QLabel("FastWhisper")
         t.setObjectName("titleLabel")
-        st = QLabel("本地语音转文字 · faster-whisper 引擎 · 模型经国内镜像站下载")
+        st = QLabel("本地语音转文字 · faster-whisper / mlx 引擎 · 模型经国内镜像站下载")
         st.setObjectName("subtitleLabel")
         title_box.addWidget(t)
         title_box.addWidget(st)
-        root.addLayout(title_box)
+
+        # 标题行右侧：偏好设置入口
+        header = QHBoxLayout()
+        header.addLayout(title_box)
+        header.addStretch(1)
+        self.settings_btn = QPushButton("⚙ 偏好设置")
+        self.settings_btn.setToolTip("设置模型存放目录与默认导出目录（持久化保存）")
+        self.settings_btn.clicked.connect(self.open_settings)
+        header.addWidget(self.settings_btn)
+        root.addLayout(header)
 
         # ---- 1. 导入 ----
         card1 = Card()
@@ -116,19 +123,17 @@ class MainWindow(QMainWindow):
         # ---- 加速选项行 ----
         grid.addWidget(self._field_label("引擎"), 3, 0)
         self.engine_combo = QComboBox()
-        self.engine_combo.addItem("CPU（faster-whisper）", "fw")
-        if mlx_available():
-            self.engine_combo.addItem("Metal GPU（mlx-whisper）", "mlx")
-        else:
-            self.engine_combo.addItem("Metal GPU（mlx-whisper，未安装）", "mlx-disabled")
+        self._fill_engines()
         self.engine_combo.setToolTip(
-            "CPU：通用稳定；Metal：Apple 芯片 GPU 加速，需安装 mlx-whisper 且模型为 MLX 格式")
+            "自动：探测本机硬件（Apple 芯片→Metal，NVIDIA 显卡→CUDA，否则 CPU）；"
+            "也可手动指定。CUDA 需系统安装 cuDNN")
         self.engine_combo.currentIndexChanged.connect(self.refresh_models)
         grid.addWidget(self.engine_combo, 3, 1)
 
-        self.batched_check = QCheckBox("批量推理（CPU 引擎更快，实测约 1.8x）")
+        self.batched_check = QCheckBox("批量推理（更快，分段较粗）")
         self.batched_check.setToolTip(
-            "VAD 切块后并行解码；分段粒度会变粗（按 30 秒窗口合并），仅对 CPU 引擎生效")
+            "VAD 切块后并行解码（CPU 实测约 1.8x）；分段粒度会变粗（按 30 秒窗口合并），"
+            "仅对 CPU / NVIDIA 引擎生效")
         grid.addWidget(self.batched_check, 3, 2, 1, 2)
 
         card2.layout().addLayout(grid)
@@ -217,24 +222,51 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"已选择：{os.path.basename(path)}（{size_mb:.1f} MB）")
 
     # ================= 模型管理 =================
-    def _current_engine(self) -> str:
-        data = self.engine_combo.currentData()
-        return data if data in ("fw", "mlx") else "fw"
+    def _fill_engines(self):
+        """按本机硬件探测结果填充引擎下拉框。"""
+        from . import hardware
+        self.engine_combo.blockSignals(True)
+        self.engine_combo.clear()
+        self.engine_combo.addItem("自动识别最佳架构（推荐）", "auto")
+        self.engine_combo.addItem(ENGINES["cpu"]["label"], "cpu")
+        self.engine_combo.addItem(
+            ENGINES["cuda"]["label"] if hardware.cuda_available()
+            else "NVIDIA GPU（未检测到）",
+            "cuda" if hardware.cuda_available() else "cuda-disabled")
+        self.engine_combo.addItem(
+            ENGINES["mlx"]["label"] if hardware.metal_available()
+            else "Metal GPU（未安装 mlx-whisper）",
+            "mlx" if hardware.metal_available() else "mlx-disabled")
+        self.engine_combo.setCurrentIndex(0)   # 默认自动
+        self.engine_combo.blockSignals(False)
 
-    def _builtin_list(self, engine: str) -> list:
-        return MLX_BUILTIN_MODELS if engine == "mlx" else FW_BUILTIN_MODELS
+    def _current_engine(self) -> str:
+        """把下拉框选择解析为具体引擎；"auto" → 硬件探测的最佳架构。"""
+        data = self.engine_combo.currentData()
+        if data in ("cpu", "cuda", "mlx"):
+            return data
+        # auto 或不可用项 → 探测最佳引擎
+        from . import hardware
+        best = hardware.detect_best()
+        return best if best in ("cpu", "cuda", "mlx") else "cpu"
+
+    def _engine_kind(self, engine: str) -> str:
+        return ENGINES.get(engine, ENGINES["cpu"])["kind"]
 
     def refresh_models(self):
-        """按当前引擎扫描本地模型 + 附上对应内置推荐项（标注未下载）。"""
+        """按当前引擎（kind）扫描本地模型 + 附上对应内置推荐项（标注未下载）。"""
+        from . import settings
         current = self.model_combo.currentData()
         engine = self._current_engine()
+        kind = self._engine_kind(engine)
+        models_dir = settings.get_models_dir()
         self.model_combo.clear()
-        local = list_local_models(MODELS_DIR, kind=engine)
+        local = list_local_models(models_dir, kind=kind)
         for path in local:
             name = os.path.basename(path)
             self.model_combo.addItem(f"• {name}", path)
-        for repo in self._builtin_list(engine):
-            path = os.path.join(MODELS_DIR, repo.replace("/", "__"))
+        for repo in ENGINES[engine]["builtin"]:
+            path = os.path.join(models_dir, repo.replace("/", "__"))
             if path not in local:
                 self.model_combo.addItem(f"○ {repo}（未下载）", repo)
         # 恢复选择
@@ -247,9 +279,23 @@ class MainWindow(QMainWindow):
         self._update_start_state()
 
     def open_model_dialog(self):
-        dlg = ModelSearchDialog(self)
+        # 传给对话框的架构 kind：cpu/cuda 共用 CTranslate2，mlx 用 MLX
+        dlg = ModelSearchDialog(engine=self._engine_kind(self._current_engine()), parent=self)
         dlg.downloadFinished.connect(lambda *_: self.refresh_models())
         dlg.exec()
+
+    def open_settings(self):
+        """打开偏好设置；保存后刷新模型列表以反映新的模型目录。"""
+        dlg = SettingsDialog(self)
+        dlg.settingsSaved.connect(self._on_settings_saved)
+        dlg.exec()
+
+    def _on_settings_saved(self):
+        from . import settings
+        self.refresh_models()
+        self.status_label.setText(
+            f"设置已保存：模型目录 {settings.get_models_dir()}"
+            + (f" · 导出目录 {settings.get_export_dir()}" if settings.get_export_dir() else ""))
 
     def _update_start_state(self):
         self.start_btn.setEnabled(
@@ -272,9 +318,24 @@ class MainWindow(QMainWindow):
                 "安装命令：\n"
                 ".venv/bin/pip install mlx-whisper")
             return
+        if self.engine_combo.currentData() == "cuda-disabled":
+            QMessageBox.information(
+                self, "未检测到 NVIDIA GPU",
+                "未检测到可用的 CUDA 环境。\n"
+                "需要 NVIDIA 显卡并安装 cuBLAS/cuDNN（CUDA 12），"
+                "或改用 CPU / Metal 引擎。")
+            return
 
-        # 内置未下载模型 → 引导先下载
-        if model_sel in self._builtin_list(engine) and not os.path.isdir(model_sel):
+        # 校验模型格式与引擎匹配（防止误用对方架构的模型）
+        if os.path.isdir(model_sel):
+            kind = local_model_kind(model_sel)
+            if kind and kind != self._engine_kind(engine):
+                QMessageBox.warning(
+                    self, "模型架构不匹配",
+                    f"所选模型是 {kind.upper()} 格式，与当前引擎（{engine}）不匹配。\n"
+                    "请切换引擎，或在「搜索 / 下载模型」中下载对应架构的模型。")
+                return
+        elif model_sel in ENGINES[engine]["builtin"]:
             QMessageBox.information(
                 self, "需要先下载模型",
                 "当前选中的模型尚未下载。\n请点击「搜索 / 下载模型…」，在列表中选中它并下载。")
@@ -293,7 +354,8 @@ class MainWindow(QMainWindow):
             task=self.task_combo.currentData(),
             beam_size=self.beam_combo.currentData(),
             use_vad=self.vad_check.isChecked(),
-            batched=(engine == "fw" and self.batched_check.isChecked()),
+            batched=(self._engine_kind(engine) == "fw"
+                     and self.batched_check.isChecked()),
         )
         self.worker.model_loading.connect(lambda: None)
         self.worker.progress_text.connect(self.status_label.setText)
@@ -347,7 +409,11 @@ class MainWindow(QMainWindow):
 
     # ================= 导出 =================
     def _save_path(self, ext: str, filter_text: str) -> str:
-        default = default_export_path(self.media_path, ext)
+        # 默认导出位置：用户设置的导出目录优先，否则跟随媒体文件所在目录
+        from . import settings
+        base = os.path.splitext(os.path.basename(self.media_path))[0]
+        default_dir = settings.get_export_dir() or (os.path.dirname(self.media_path) or ".")
+        default = os.path.join(default_dir, f"{base}_转写稿.{ext}")
         path, _ = QFileDialog.getSaveFileName(self, "导出", default, filter_text)
         return path
 

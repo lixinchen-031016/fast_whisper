@@ -25,23 +25,64 @@ fast_whisper/
 
 ## 快速开始
 
+### macOS
+
 ```bash
 cd /Users/lixinchen/PycharmProjects/fast_whisper
-
-# 1. 激活项目自带虚拟环境（已封装全部依赖）
 source .venv/bin/activate
-
-# 2. 启动应用
 python main.py
 ```
 
-如需在其他机器重建环境：
+### Windows
+
+```powershell
+cd fast_whisper
+.venv\Scripts\activate
+python main.py        # 或 pythonw main.py 隐藏控制台窗口
+```
+
+如需在其他机器重建虚拟环境：
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
+
+## 偏好设置（持久化）
+
+主窗口右上角「⚙ 偏好设置」：
+
+- **模型存放目录**：默认项目内 `models/`（打包版为用户主目录 `~/FastWhisper/models`），可改为任意磁盘位置；保存后模型列表自动重新扫描；
+- **默认导出目录**：默认跟随媒体文件所在目录，可指定固定目录（如 `D:\转写稿`）。
+
+设置通过 QSettings（ini 格式）持久化：macOS 位于
+`~/.config/FastWhisper/FastWhisper.ini`，Windows 位于
+`%APPDATA%\FastWhisper\FastWhisper.ini`，可随目录整体备份迁移。
+注意：修改模型目录后，已有模型文件需手动迁移到新目录。
+
+## 跨平台兼容说明
+
+| 事项 | 处理方式 |
+|------|---------|
+| 路径分隔符 | 全部经 `os.path.join`/`os.path.normpath` 构造，无硬编码 `/` 或 `\` |
+| 字体 | QSS 字体栈按平台自动选择（macOS 苹方 / Windows 微软雅黑 / Linux Noto） |
+| 安装目录只读 | 打包态默认模型目录落在用户主目录，不写安装目录 |
+| GPU 探测 | 运行时自动探测 Metal / CUDA，均不可用则回退 CPU；CUDA 缺 cuDNN 时加载失败自动回退 |
+| 可选依赖 | mlx-whisper 仅 macOS 可安装，缺失时界面显示"未安装"而非报错 |
+| 高分屏 | `HighDpiScaleFactorRoundingPolicy.PassThrough`，Retina / Windows 125% 缩放均正常 |
+
+## 自动构建与发布（GitHub Actions）
+
+`.github/workflows/build.yml` 提供 macOS（.app/.dmg）与 Windows（单文件 .exe）
+的自动构建流水线：
+
+- **test 门禁**：Ubuntu 上运行 pytest（设置持久化 / 引擎过滤 / offscreen 界面构造）；
+- **并行构建**：Windows x86_64 单文件 exe + macOS arm64 .app/.dmg，PyInstaller 打包
+  并显式收集 `faster_whisper`/`ctranslate2`/`av`/`tokenizers`/`onnxruntime` 隐藏依赖，
+  构建后自动冒烟启动；
+- **双轨发布**：推送 `v*` 标签 → 正式 Release；推送 main → 滚动 nightly 预发布
+  （覆盖上一次，标题带 commit 哈希）；PR 只测试不发布。
 
 ## 使用流程
 
@@ -72,24 +113,21 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 全部推理在本机 CPU（int8 量化）完成，**不联网、不上传音频**，隐私安全。
 
-## 加速：Metal GPU（Apple Silicon）
+## 加速：多架构引擎（自动识别）
 
-**说明**：faster-whisper 的底层引擎 CTranslate2 不支持 Apple GPU（实测
-`device="metal"` 返回 `unsupported device metal`），因此 Mac 上的 GPU 加速
-通过第二引擎 **mlx-whisper**（Apple 官方 MLX 框架）实现。
+「引擎」下拉框默认 **自动识别最佳架构**：Apple 芯片 → Metal，NVIDIA 显卡 → CUDA，否则 CPU。也可手动指定。
 
-在设置区的「引擎」中切换：
-
-| 引擎 | 运行方式 | 适用模型格式 | 实测（M4，70s 音频） |
-|------|---------|-------------|--------------------|
-| CPU（faster-whisper） | CPU int8 量化，可选批量推理 | CTranslate2（`Systran/faster-whisper-*`） | tiny 25x；批量模式再快约 1.8x |
+| 引擎 | 运行方式 | 模型格式 | 实测（M4，70s 音频） |
+|------|---------|---------|--------------------|
+| CPU（faster-whisper） | CPU int8，可选批量推理 | CTranslate2（`Systran/faster-whisper-*`） | tiny 25x；批量模式再快约 1.8x |
+| NVIDIA GPU（faster-whisper·CUDA） | CUDA float16 | CTranslate2（同上，与 CPU 通用） | 取决于显卡，需 cuDNN |
 | Metal GPU（mlx-whisper） | Apple GPU 原生推理 | MLX（`mlx-community/whisper-*`） | large-v3-turbo 5.1x 实时（含加载），识别质量更高 |
 
-- Metal 引擎需要先安装：`.venv/bin/pip install mlx-whisper`（requirements.txt 中已注释标注）；
-- 两个引擎的模型格式不通用，切换引擎后模型下拉列表会自动联动，未下载的
-  `mlx-community/*` 模型仍通过「搜索 / 下载模型…」从镜像站拉取；
-- 经验法则：tiny/base 级别模型 CPU 更快；**medium 及以上模型用 Metal 引擎更划算**；
-- 批量推理勾选框仅对 CPU 引擎生效（Metal 本身已是并行推理）。
+- **CUDA**：需要 NVIDIA 显卡 + 系统安装 cuBLAS/cuDNN（CUDA 12）；未检测到显卡时引擎项显示"未检测到"。若加载失败（如缺 cuDNN），程序会**自动回退 CPU** 并提示，不会中断。
+- **Metal**：需安装 mlx-whisper（`.venv/bin/pip install mlx-whisper`，requirements.txt 中已注释标注）。
+- **模型搜索按架构过滤**：「搜索 / 下载模型」对话框会跟随当前引擎切换架构——CPU/NVIDIA 只搜 CTranslate2 格式（`faster-whisper`/`ct2`），Apple 只搜 MLX 格式（限定 `mlx-community`）；选错架构格式的模型在启动转写时也会被拦截提醒。
+- 经验法则：tiny/base 级别模型 CPU 更快；**medium 及以上模型用 GPU 引擎更划算**；
+- 批量推理勾选框仅对 CPU / NVIDIA 引擎生效（Metal 本身已是并行推理）。
 
 ## 技术要点
 
