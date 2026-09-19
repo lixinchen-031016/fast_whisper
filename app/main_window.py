@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStatusBar,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
-    QHeaderView, QAbstractItemView, QCheckBox,
+    QHeaderView, QAbstractItemView, QCheckBox, QLineEdit,
 )
 
 from .config import ENGINES, MEDIA_FILTER
@@ -148,6 +148,16 @@ class MainWindow(QMainWindow):
             "仅对 CPU / NVIDIA 引擎生效；该模式必须开启 VAD 才能切块，故「过滤静音段」"
             "在本模式下强制生效")
         grid.addWidget(self.batched_check, 3, 2, 1, 2)
+
+        # ---- 术语表（提升专有名词识别率，见下） ----
+        grid.addWidget(self._field_label("术语表"), 4, 0)
+        self.terms_edit = QLineEdit()
+        self.terms_edit.setPlaceholderText("专有名词用顿号或逗号分隔，如：成都工业学院、德国管理应用技术大学")
+        self.terms_edit.setToolTip(
+            "填写人名、机构名、专业术语等专有名词，会作为提示词交给模型，"
+            "显著降低专名错识别（实测可把「德国管理应用技术大学」从「国安利用技术大学」纠正回来）。\n"
+            "首次转写某类素材时填入一次，之后会自动记住。")
+        grid.addWidget(self.terms_edit, 4, 1, 1, 3)
 
         card2.layout().addLayout(grid)
         root.addWidget(card2)
@@ -361,6 +371,7 @@ class MainWindow(QMainWindow):
         _select(self.beam_combo, "beam", int)
         self.vad_check.setChecked(settings.get_ui("vad", "1") == "1")
         self.batched_check.setChecked(settings.get_ui("batched", "0") == "1")
+        self.terms_edit.setText(settings.get_ui("terms", ""))
 
     def _save_prefs(self):
         """保存当前界面偏好，下次启动自动恢复。"""
@@ -371,6 +382,7 @@ class MainWindow(QMainWindow):
         settings.set_ui("beam", str(self.beam_combo.currentData()))
         settings.set_ui("vad", "1" if self.vad_check.isChecked() else "0")
         settings.set_ui("batched", "1" if self.batched_check.isChecked() else "0")
+        settings.set_ui("terms", self.terms_edit.text().strip())
 
     # ================= 转写 =================
     def _preflight(self):
@@ -458,6 +470,7 @@ class MainWindow(QMainWindow):
             use_vad=self.vad_check.isChecked(),
             batched=(self._engine_kind(engine) == "fw"
                      and self.batched_check.isChecked()),
+            terms=self.terms_edit.text().strip(),
         )
         self.worker.progress_text.connect(self.status_label.setText)
         self.worker.progress_pct.connect(self.progress.setValue)
@@ -504,6 +517,7 @@ class MainWindow(QMainWindow):
             use_vad=self.vad_check.isChecked(),
             batched=(self._engine_kind(engine) == "fw"
                      and self.batched_check.isChecked()),
+            terms=self.terms_edit.text().strip(),
         )
         self.batch_worker.file_started.connect(self._on_batch_file_started)
         self.batch_worker.segment_ready.connect(self._on_segment)

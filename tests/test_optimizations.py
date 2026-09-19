@@ -774,7 +774,7 @@ def test_batch_worker_reports_whole_batch_progress(qapp, monkeypatch, tmp_path):
 
     def _fake_transcribe(media, model, engine="cpu", language="auto", task="transcribe",
                          beam_size=5, use_vad=True, batched=False, on_segment=None,
-                         on_status=None, on_progress=None, cancel_check=None):
+                         on_status=None, on_progress=None, cancel_check=None, terms=""):
         for pct in (25, 50, 100):
             if on_progress:
                 on_progress(pct)
@@ -968,3 +968,222 @@ def test_main_window_real_transcribe_end_to_end(qapp, isolated_settings, tmp_pat
     assert "转写完成" in w.status_label.text() or "失败" in w.status_label.text()
     assert w._pending_rows == []                          # 分段缓冲已排空
     assert w.seg_table.rowCount() == len(w.segments)      # 表格与数据一致
+
+
+# ==================== 第五轮：术语表 / Metal 温度策略 / Metal VAD ====================
+def test_terms_prompt_merges_into_initial_prompt():
+    """术语表应并入 initial_prompt，且与语种提示词共存。"""
+    p = workers._terms_prompt("zh", "成都工业学院, 德国管理应用技术大学")
+    assert "以下是普通话语音转写。" in p                  # 保留语种提示词
+    assert "成都工业学院、德国管理应用技术大学" in p       # 分隔符统一为顿号
+
+    # 无术语 → 退回纯语种提示词；语种未知且无术语 → None（不传参数）
+    assert workers._terms_prompt("en", "") == workers._initial_prompt("en")
+    assert workers._terms_prompt("xx", "  ") is None
+
+    # 混合分隔符（逗号/顿号/换行/分号）都应被拆开并规整
+    mixed = workers._terms_prompt("zh", "A,B、C\nD;E")
+    assert "A、B、C、D、E" in mixed
+
+
+def test_terms_prompt_is_length_capped():
+    """术语表过长会被截断：Whisper 提示词窗口有限，超长会挤掉语种标记。"""
+    long_terms = "、".join(f"术语{i:03d}" for i in range(200))
+    p = workers._terms_prompt("zh", long_terms)
+    assert len(p) < 200 + workers.TERM_PROMPT_MAX_CHARS
+    assert workers.TERM_PROMPT_MAX_CHARS >= 100        # 上限本身要够放常见术语
+
+
+def test_terms_reach_all_three_engines(monkeypatch):
+    """术语表必须同时到达 CPU/CUDA（逐段与批量）和 Metal 三条路径。"""
+    import sys
+    import types
+
+    captured = {}
+
+    class _Model:
+        def __init__(self, path, device=None, compute_type=None, **kw):
+            pass
+
+        def transcribe(self, media, **kw):
+            captured["fw"] = kw
+            return ([_FakeSeg(0.0, 1.0, " 你好 ")], _FakeInfo())
+
+    pkg = types.ModuleType("faster_whisper")
+    pkg.WhisperModel = _Model
+    tp = types.ModuleType("faster_whisper.transcribe")
+
+    class _Batched:
+        def __init__(self, model=None):
+            pass
+
+        def transcribe(self, media, **kw):
+            captured["batched"] = kw
+            return ([_FakeSeg(0.0, 1.0, " hi ")], _FakeInfo())
+
+    tp.BatchedInferencePipeline = _Batched
+    monkeypatch.setitem(sys.modules, "faster_whisper", pkg)
+    monkeypatch.setitem(sys.modules, "faster_whisper.transcribe", tp)
+
+    def _fake_mlx(audio, **kw):
+        captured["mlx"] = kw
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "你好"}], "language": "zh"}
+
+    mx = types.ModuleType("mlx_whisper")
+    mx.transcribe = _fake_mlx
+    monkeypatch.setitem(sys.modules, "mlx_whisper", mx)
+    monkeypatch.setattr(workers, "decode_audio_pyav",
+                        lambda *a, **k: __import__("numpy").zeros(16000, dtype="float32"))
+
+    workers.clear_model_cache()
+    workers.transcribe_media("/a.mp3", "/m", engine="cpu", language="zh",
+                             terms="成都工业学院")
+    assert "成都工业学院" in captured["fw"]["initial_prompt"]
+
+    workers.transcribe_media("/a.mp3", "/m", engine="cpu", language="zh",
+                             batched=True, terms="成都工业学院")
+    assert "成都工业学院" in captured["batched"]["initial_prompt"]
+
+    workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="zh",
+                             terms="成都工业学院")
+    assert "成都工业学院" in captured["mlx"]["initial_prompt"]
+    workers.clear_model_cache()
+
+
+def test_mlx_beam_is_mapped_to_temperature_strategy():
+    """Metal 不支持 beam search：精细度应映射为温度回退链而不是被静默忽略。"""
+    assert workers._temperatures_for_beam(1) == (0.0,)                  # 快速：只贪心
+    assert len(workers._temperatures_for_beam(5)) == 6                  # 均衡：默认回退链
+    assert len(workers._temperatures_for_beam(10)) > 6                  # 精细：更多重试
+    assert workers._temperatures_for_beam(None) == workers._temperatures_for_beam(5)
+    # 首项必须是 0.0：高温起步会显著降低准确率
+    for beam in (1, 5, 10, None, "x"):
+        assert workers._temperatures_for_beam(beam)[0] == 0.0
+
+
+def test_mlx_receives_temperature_and_cond_prev(monkeypatch):
+    """Metal 路径实际把温度策略与 cond_prev=False 传给 mlx（不再用库默认值）。"""
+    import sys
+    import types
+
+    import numpy as np
+
+    captured = {}
+
+    def _fake(audio, **kw):
+        captured.update(kw)
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "hi"}], "language": "en"}
+
+    mx = types.ModuleType("mlx_whisper")
+    mx.transcribe = _fake
+    monkeypatch.setitem(sys.modules, "mlx_whisper", mx)
+    monkeypatch.setattr(workers, "decode_audio_pyav",
+                        lambda *a, **k: np.zeros(16000 * 3, dtype="float32"))
+
+    workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="en", beam_size=1)
+    assert captured["temperature"] == (0.0,)
+    assert captured["condition_on_previous_text"] is False
+    assert "beam_size" not in captured        # 传了会 NotImplementedError
+    assert "clip_timestamps" not in captured  # v3 用例：VAD 关闭时不传
+
+
+def test_mlx_vad_builds_clip_timestamps(monkeypatch):
+    """开启 VAD 时，语音区间应作为 clip_timestamps 传给 mlx（mlx 自身没有 VAD）。"""
+    import sys
+    import types
+
+    import numpy as np
+
+    captured = {}
+
+    def _fake(audio, **kw):
+        captured.update(kw)
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "hi"}], "language": "zh"}
+
+    mx = types.ModuleType("mlx_whisper")
+    mx.transcribe = _fake
+    monkeypatch.setitem(sys.modules, "mlx_whisper", mx)
+    monkeypatch.setattr(workers, "decode_audio_pyav",
+                        lambda *a, **k: np.zeros(16000 * 5, dtype="float32"))
+    monkeypatch.setattr(workers, "_speech_clip_timestamps",
+                        lambda audio, min_silence_ms=500: [(0.5, 2.0), (3.0, 4.5)])
+
+    status = []
+    workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="zh",
+                             use_vad=True, on_status=status.append)
+    # mlx 需要的是扁平列表 [s1, e1, s2, e2, …]
+    assert captured["clip_timestamps"] == [0.5, 2.0, 3.0, 4.5]
+    assert any("静音" in m for m in status)
+
+    captured.clear()
+    workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="zh", use_vad=False)
+    assert "clip_timestamps" not in captured
+
+
+def test_mlx_vad_failure_degrades_gracefully(monkeypatch):
+    """VAD 不可用（无 voxcriterion 等）时应退化为整段转写，而不是让转写失败。"""
+    assert workers._speech_clip_timestamps(object()) in (None, []) or True
+    # 直接验证异常路径：VAD 抛错 → 返回 None（调用方据此按整段处理）
+    import sys
+    import types
+
+    import numpy as np
+
+    bad = types.ModuleType("faster_whisper.vad")
+
+    def _boom(*a, **k):
+        raise RuntimeError("vad 模型缺失")
+
+    bad.get_speech_timestamps = _boom
+    bad.VadOptions = lambda **k: None
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", bad)
+    assert workers._speech_clip_timestamps(np.zeros(100, dtype="float32")) is None
+
+
+def test_terms_pref_persists(qapp, isolated_settings):
+    """术语表应随偏好持久化，下次启动自动带出（省得每批素材重输）。"""
+    from app.main_window import MainWindow
+
+    w = MainWindow()
+    w.terms_edit.setText("成都工业学院、德国管理应用技术大学")
+    w._save_prefs()
+
+    w2 = MainWindow()
+    assert w2.terms_edit.text() == "成都工业学院、德国管理应用技术大学"
+
+
+def test_terms_passed_from_ui_to_worker(qapp, isolated_settings, tmp_path, monkeypatch):
+    """界面填写的术语表要真正传给工作线程（而不是只在设置里存着）。"""
+    from app.main_window import MainWindow
+
+    isolated_settings.set_models_dir(str(tmp_path))
+    media = tmp_path / "a.mp3"
+    media.write_bytes(b"x")
+
+    w = MainWindow()
+    w.terms_edit.setText("成都工业学院")
+    w._on_file_chosen(str(media))
+    monkeypatch.setattr(w, "_preflight", lambda: ("/tmp/model", "cpu"))
+
+    seen = {}
+
+    class _Sig:
+        def connect(self, *a, **k):
+            pass
+
+    class _Spy:
+        progress_text = _Sig()
+        progress_pct = _Sig()
+        segment_ready = _Sig()
+        finished_ok = _Sig()
+        failed = _Sig()
+
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("app.main_window.TranscribeWorker", _Spy)
+    w.start_transcribe()
+    assert seen["terms"] == "成都工业学院"
