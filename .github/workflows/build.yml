@@ -43,6 +43,8 @@ env:
   PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONUNBUFFERED: "1"
+  # Windows 运行器控制台默认 cp1252，中文输出会抛 UnicodeEncodeError
+  PYTHONUTF8: "1"
 
 jobs:
   # ---------------------------------------------------------------------------

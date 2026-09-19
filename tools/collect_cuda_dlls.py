@@ -17,6 +17,11 @@ import os
 import shutil
 import sys
 
+# Windows CI 控制台默认 cp1252，打印中文会抛 UnicodeEncodeError，强制 UTF-8
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def main():
     if len(sys.argv) != 2:
