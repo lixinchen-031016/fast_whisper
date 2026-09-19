@@ -105,3 +105,38 @@ def test_model_search_dialog_construct(qapp, isolated_settings):
     for engine, arch in (("fw", "cpu"), ("mlx", "mlx")):
         dlg = ModelSearchDialog(engine=engine)
         assert dlg.arch_combo.currentData() == arch
+
+# ---------- 媒体解码（内置 FFmpeg / PyAV） ----------
+def test_check_media_decode_ok():
+    """本地/CI 均安装了 PyAV，预检应通过（返回空串）。"""
+    from app.workers import check_media_decode
+    assert check_media_decode() == ""
+
+
+def test_friendly_media_error_mapping():
+    from app.workers import _friendly_media_error
+
+    class FakeAVFileNotFound(Exception):
+        pass
+    FakeAVFileNotFound.__module__ = "av.error"
+    FakeAVFileNotFound.__name__ = "FileNotFoundError"
+
+    # av 体系异常 → 解码提示
+    msg = _friendly_media_error(FakeAVFileNotFound("no such file"))
+    assert "无法解码" in msg or "无法打开" in msg
+    # DLL 加载失败 → 重装提示
+    assert "重新下载" in _friendly_media_error(Exception("DLL load failed while importing av"))
+    # 普通异常原样透传
+    assert _friendly_media_error(Exception("其他错误")) == "其他错误"
+
+
+def test_collect_native_libs_macos_probe():
+    """非 Windows 平台运行收集脚本：探测 av 正常即 exit 0。"""
+    import subprocess
+    import sys
+    r = subprocess.run(
+        [sys.executable, "tools/collect_native_libs.py",
+         os.path.join(os.path.dirname(__file__), "_tmp_libs")],
+        capture_output=True, text=True)
+    assert r.returncode == 0
+    assert "PyAV" in r.stdout

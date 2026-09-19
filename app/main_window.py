@@ -15,7 +15,9 @@ from .config import ENGINES, MEDIA_FILTER
 from .exporter import export_docx, export_markdown, export_srt, export_txt
 from .theme import TEXT_SECOND
 from .widgets import Card, DropArea, ModelSearchDialog, SettingsDialog
-from .workers import TranscribeWorker, list_local_models, local_model_kind
+from .workers import (
+    TranscribeWorker, check_media_decode, list_local_models, local_model_kind,
+)
 
 LANGS = [("自动检测", "auto"), ("中文", "zh"), ("英语", "en"), ("日语", "ja"),
          ("韩语", "ko"), ("德语", "de"), ("法语", "fr"), ("西班牙语", "es")]
@@ -305,6 +307,12 @@ class MainWindow(QMainWindow):
 
     # ================= 转写 =================
     def start_transcribe(self):
+        # 预检：内置 FFmpeg（PyAV）是否可用，不可用给出清晰指引而非裸报错
+        decode_problem = check_media_decode()
+        if decode_problem:
+            QMessageBox.critical(self, "解码器不可用", decode_problem)
+            return
+
         model_sel = self.model_combo.currentData()
         engine = self._current_engine()
         if not self.media_path or not model_sel:

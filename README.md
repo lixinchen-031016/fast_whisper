@@ -158,3 +158,13 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
 - **Q: 想用 GPU？** 当前版本固定 CPU + int8（跨平台零依赖）；
   如需 CUDA，可将 `workers.py` 中 `WhisperModel(...)` 的参数改为
   `device="cuda", compute_type="float16"`。
+
+## 关于 FFmpeg 的说明（无需手动安装）
+
+视频/音频解码使用 **PyAV 自带的 FFmpeg 共享库**——安装包已内置，**无需用户
+单独安装 FFmpeg 或配置环境变量**。双击即可转写视频。
+
+- 启动转写前程序会自动预检解码器，不可用时弹窗给出明确指引；
+- Windows 安装包构建时经 `tools/collect_native_libs.py` 将 FFmpeg DLL
+  （以及 CUDA 运行库）嵌入 exe；macOS .app 由 PyInstaller 的 av 钩子打包 dylibs；
+- 若出现"内置 FFmpeg 库加载失败"，说明安装包不完整，重新下载即可。

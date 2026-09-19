@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """后台工作线程：模型下载与语音转写，均通过信号与界面通信。"""
 import os
+import sys
 import traceback
 
 from PySide6.QtCore import QThread, Signal
@@ -152,7 +153,7 @@ class TranscribeWorker(QThread):
             self.finished_ok.emit(segs, info_obj)
         except Exception as e:
             traceback.print_exc()
-            self.failed.emit(f"{e}")
+            self.failed.emit(_friendly_media_error(e))
 
     # ---------- mlx-whisper（Metal GPU，仅 macOS） ----------
     def _run_mlx(self):
@@ -191,7 +192,7 @@ class TranscribeWorker(QThread):
             self.finished_ok.emit(segs, info_obj)
         except Exception as e:
             traceback.print_exc()
-            self.failed.emit(f"{e}")
+            self.failed.emit(_friendly_media_error(e))
 
 
 def mlx_available() -> bool:
@@ -201,6 +202,56 @@ def mlx_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def check_media_decode() -> str:
+    """预检媒体解码能力（PyAV 内置 FFmpeg）。
+
+    返回空字符串表示可用；否则返回面向用户的中文错误说明。
+    PyAV 的 FFmpeg 库在 import av 时即加载，导入成功即可用。
+    """
+    try:
+        import av  # noqa: F401
+        return ""
+    except ImportError as e:
+        if getattr(sys, "frozen", False):
+            return (
+                "内置解码器（FFmpeg）初始化失败，视频/音频转写不可用。\n"
+                f"详细信息：{e}\n"
+                "请重新下载安装包；若反复出现请附本提示反馈。"
+            )
+        return (
+            "缺少 PyAV（内置 FFmpeg 的解码库），视频/音频转写不可用。\n"
+            f"详细信息：{e}\n"
+            "开发环境请执行：pip install av"
+        )
+    except Exception as e:
+        return (
+            "内置解码器（FFmpeg）加载失败，视频/音频转写不可用。\n"
+            f"详细信息：{e}\n"
+            "安装包可能不完整，请重新下载。"
+        )
+
+
+def _friendly_media_error(e: Exception) -> str:
+    """把底层解码/转写异常翻译成用户能看懂的提示。"""
+    msg = str(e)
+    type_name = type(e).__name__
+    # PyAV 打不开文件：路径不存在、容器/编码不支持、文件损坏
+    if type_name.startswith("FileNotFoundError") or "No such file" in msg:
+        return f"无法打开媒体文件：路径不存在或文件已被移动。\n{msg}"
+    if type(e).__module__.startswith("av") or type_name.startswith("InvalidData"):
+        return (
+            "无法解码该媒体文件：可能是格式不支持或文件损坏。\n"
+            f"详细信息：{msg}"
+        )
+    if "DLL load failed" in msg or "dylib" in msg or "ffmpeg" in msg.lower():
+        return (
+            "内置 FFmpeg 库加载失败，安装可能不完整。\n"
+            f"详细信息：{msg}\n"
+            "请重新下载安装包；若反复出现请附本提示反馈。"
+        )
+    return msg
 
 
 def local_model_kind(path: str):

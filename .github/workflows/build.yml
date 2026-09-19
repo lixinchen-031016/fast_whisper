@@ -92,8 +92,9 @@ jobs:
   #    - PyInstaller 需显式收集 faster-whisper 生态的隐藏依赖：
   #      ctranslate2（C++ 扩展）、av（自带 FFmpeg 库）、tokenizers（Rust 扩展）、
   #      onnxruntime（Silero VAD），漏收会在运行时报 ModuleNotFoundError
-  #    - CUDA：安装 nvidia-cublas/cudnn-cu12 后用 tools/collect_cuda_dlls.py
-  #      把 DLL 收集进包（C++ 层按名加载，Python 依赖分析发现不了）
+  #    - 原生库内嵌（tools/collect_native_libs.py）：
+  #      a) PyAV 内置 FFmpeg 的 DLL —— 视频解码必需，缺失会报"缺少 FFmpeg"
+  #      b) NVIDIA CUDA 运行库 —— NVIDIA 加速可选
   # ---------------------------------------------------------------------------
   build-windows:
     name: 构建 Windows x86_64 (.exe)
@@ -120,10 +121,10 @@ jobs:
       - name: 校验 x86_64 架构
         run: python -c "import platform, sys; print(sys.version); assert platform.machine() in ('AMD64', 'x86_64'), platform.machine()"
 
-      - name: 收集 CUDA 运行库 DLL
-        run: python tools/collect_cuda_dlls.py build/cuda_dlls
+      - name: 收集原生库（PyAV/FFmpeg + CUDA 运行库）
+        run: python tools/collect_native_libs.py build/cuda_dlls
 
-      - name: 打包单文件 exe（无控制台窗口，内嵌 CUDA 运行库）
+      - name: 打包单文件 exe（无控制台窗口，内嵌 FFmpeg 与 CUDA 运行库）
         shell: pwsh
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
