@@ -1,0 +1,3 @@
+# macOS 专属：Metal GPU 加速引擎（仅 Apple Silicon）
+# mlx-whisper 会自动拉取 mlx、numba 等运行依赖
+mlx-whisper>=0.4

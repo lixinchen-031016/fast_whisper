@@ -1,8 +1,8 @@
-# FastWhisper 依赖清单（安装到项目 .venv）
+# FastWhisper 基础依赖（跨平台通用，安装到项目 .venv）
+# GPU 引擎依赖按平台追加：
+#   macOS : pip install -r requirements-macos.txt   （mlx-whisper，Metal 加速）
+#   Windows: pip install -r requirements-windows.txt （CUDA 运行库，NVIDIA 加速）
 PySide6>=6.6
 faster-whisper>=1.0
 python-docx>=1.1
 requests>=2.31
-
-# 可选：Metal GPU 加速引擎（仅 macOS Apple Silicon）
-# mlx-whisper>=0.5

@@ -47,6 +47,10 @@ python main.py        # 或 pythonw main.py 隐藏控制台窗口
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 可选：按平台加装 GPU 引擎
+pip install -r requirements-macos.txt    # macOS：Metal 引擎（mlx-whisper）
+pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 引擎）
 ```
 
 ## 偏好设置（持久化）
@@ -81,6 +85,12 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 - **并行构建**：Windows x86_64 单文件 exe + macOS arm64 .app/.dmg，PyInstaller 打包
   并显式收集 `faster_whisper`/`ctranslate2`/`av`/`tokenizers`/`onnxruntime` 隐藏依赖，
   构建后自动冒烟启动；
+- **GPU 引擎捆绑**：
+  - macOS 构建安装 `requirements-macos.txt`（mlx-whisper）并以
+    `--collect-all mlx mlx_whisper numba` 内嵌 Metal 引擎；
+  - Windows 构建安装 `requirements-windows.txt`（nvidia-cublas/cudnn-cu12），
+    经 `tools/collect_cuda_dlls.py` 收集 DLL 后以 `--add-binary` 内嵌，
+    启动时自动把解压目录加入 DLL 搜索路径；
 - **双轨发布**：推送 `v*` 标签 → 正式 Release；推送 main → 滚动 nightly 预发布
   （覆盖上一次，标题带 commit 哈希）；PR 只测试不发布。
 

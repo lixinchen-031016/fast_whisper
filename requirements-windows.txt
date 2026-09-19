@@ -1,0 +1,5 @@
+# Windows 专属：NVIDIA GPU（CUDA 12）运行库
+# CTranslate2 推理时需加载 cuBLAS / cuDNN 的 DLL，这两个包提供官方编译版本
+# 注意：仍需 NVIDIA 显卡驱动；构建产物通过 tools/collect_cuda_dlls.py 收集 DLL
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

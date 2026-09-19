@@ -25,11 +25,28 @@ def _ensure_dirs():
         pass  # 目录不可创建时由具体功能再行报错，不阻断启动
 
 
+def _setup_frozen_env():
+    """打包态（onefile）：把解压目录加入 DLL 搜索路径。
+
+    Windows 内嵌的 CUDA 运行库（cublas/cudnn DLL）随 exe 解压到 _MEIPASS，
+    CTranslate2 的 C++ 层按名称加载它们，必须让该目录处于搜索路径中。
+    """
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            os.environ["PATH"] = meipass + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(meipass)
+            except (AttributeError, OSError):
+                pass  # 非 Windows 系统无 add_dll_directory，忽略
+
+
 def main():
     # 高分屏支持（Windows 缩放 / macOS Retina）
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
+    _setup_frozen_env()
     app = QApplication(sys.argv)
     app.setApplicationName("FastWhisper")
     app.setApplicationDisplayName("FastWhisper 语音转文字")

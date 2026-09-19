@@ -5,7 +5,8 @@
 #   - 类型    : 跨平台桌面应用（PySide6 / Qt GUI），非服务端程序
 #   - 运行时  : Python 3.11+（本地 3.13 验证）
 #   - 技术栈  : PySide6、faster-whisper（CTranslate2）、PyAV、python-docx；
-#              可选引擎 mlx-whisper 仅 macOS 可用，CI 不安装（运行时自动探测降级）
+#              GPU 引擎按平台捆绑——macOS 装 mlx-whisper（Metal），
+#              Windows 装 nvidia-cublas/cudnn（CUDA 12 运行库）并收集 DLL
 #   - 测试    : pytest（tests/test_smoke.py：设置持久化 / 引擎过滤 / offscreen
 #              界面构造），QT_QPA_PLATFORM=offscreen，Ubuntu 无需显示器
 #   - 部署目标: 桌面分发产物，统一发布到 GitHub Releases（nightly 滚动预发布
@@ -89,6 +90,8 @@ jobs:
   #    - PyInstaller 需显式收集 faster-whisper 生态的隐藏依赖：
   #      ctranslate2（C++ 扩展）、av（自带 FFmpeg 库）、tokenizers（Rust 扩展）、
   #      onnxruntime（Silero VAD），漏收会在运行时报 ModuleNotFoundError
+  #    - CUDA：安装 nvidia-cublas/cudnn-cu12 后用 tools/collect_cuda_dlls.py
+  #      把 DLL 收集进包（C++ 层按名加载，Python 依赖分析发现不了）
   # ---------------------------------------------------------------------------
   build-windows:
     name: 构建 Windows x86_64 (.exe)
@@ -103,17 +106,23 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-windows.txt
 
-      - name: 安装依赖
+      - name: 安装依赖（含 CUDA 12 运行库）
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt -r requirements-windows.txt pyinstaller
 
       - name: 校验 x86_64 架构
         run: python -c "import platform, sys; print(sys.version); assert platform.machine() in ('AMD64', 'x86_64'), platform.machine()"
 
-      - name: 打包单文件 exe（无控制台窗口）
+      - name: 收集 CUDA 运行库 DLL
+        run: python tools/collect_cuda_dlls.py build/cuda_dlls
+
+      - name: 打包单文件 exe（无控制台窗口，内嵌 CUDA 运行库）
+        shell: pwsh
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
           --name ${{ env.APP_NAME }}
@@ -122,6 +131,7 @@ jobs:
           --collect-all tokenizers
           --collect-all av
           --collect-all onnxruntime
+          --add-binary "build\cuda_dlls\*.dll;."
           main.py
 
       - name: 冒烟启动 Windows 应用
@@ -146,7 +156,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # 2) 构建 macOS ARM64 原生产物（.app + .dmg）
   #    - macos-latest 为 Apple Silicon 运行器，原生 arm64 构建
-  #    - 不安装 mlx-whisper：Metal 引擎为可选组件，应用启动时自动探测降级 CPU
+  #    - 捆绑 mlx-whisper（Metal GPU 引擎），打包时收集 mlx 的 metalfib 等资源
   # ---------------------------------------------------------------------------
   build-macos:
     name: 构建 macOS arm64 (.app / .dmg)
@@ -161,17 +171,19 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-macos.txt
 
-      - name: 安装依赖
+      - name: 安装依赖（含 Metal 引擎 mlx-whisper）
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt -r requirements-macos.txt pyinstaller
 
       - name: 校验 arm64 架构
         run: python -c "import platform, sys; print(sys.version); assert platform.machine() == 'arm64', platform.machine()"
 
-      - name: 打包 .app（窗口模式）
+      - name: 打包 .app（窗口模式，内嵌 Metal 引擎）
         run: >
           pyinstaller --noconfirm --clean --windowed
           --name ${{ env.APP_NAME }}
@@ -180,6 +192,9 @@ jobs:
           --collect-all tokenizers
           --collect-all av
           --collect-all onnxruntime
+          --collect-all mlx
+          --collect-all mlx_whisper
+          --collect-all numba
           main.py
 
       - name: 冒烟启动 macOS 应用
