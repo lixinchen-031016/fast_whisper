@@ -30,6 +30,12 @@ MEDIA_FILTER = (
     "所有文件 (*)"
 )
 
+# 可转写媒体扩展名（小写，含点）——批量扫描文件夹时使用，与 MEDIA_FILTER 保持一致
+MEDIA_EXTS = {
+    ".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm",
+    ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+}
+
 # 内置推荐模型（CTranslate2 格式，供 faster-whisper CPU / CUDA 引擎共用）
 FW_BUILTIN_MODELS = [
     "Systran/faster-whisper-tiny",

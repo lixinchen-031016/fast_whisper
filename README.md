@@ -13,11 +13,11 @@ fast_whisper/
 │   ├── __init__.py
 │   ├── config.py            # 路径常量、镜像站地址、媒体过滤器、内置模型列表
 │   ├── theme.py             # 苹果风格主题（全局 QSS：圆角卡片、系统蓝、留白）
-│   ├── model_manager.py     # 模型搜索/下载（hf-mirror.com，流式下载 + 断点续传）
-│   ├── workers.py           # QThread 后台线程：下载进度、转写推理
+│   ├── model_manager.py     # 模型搜索/下载（hf-mirror.com，多文件并行 + 断点续传 + 完整性校验）
+│   ├── workers.py           # QThread 后台线程：下载进度、单文件/批量转写；进程内模型缓存
 │   ├── exporter.py          # 导出器：TXT / SRT / Markdown / DOCX
 │   ├── widgets.py           # 可复用组件：圆角卡片、拖放导入区、模型搜索对话框
-│   └── main_window.py       # 主窗口：导入 → 设置 → 转写 → 预览 → 导出
+│   └── main_window.py       # 主窗口：导入 → 设置 → 转写（单文件/批量）→ 预览 → 导出
 ├── models/                  # 下载的模型存放目录（每个模型一个子目录）
 ├── output/                  # 默认导出目录
 └── .venv/                   # 独立虚拟环境（所有依赖封装于此，可整体拷贝）
@@ -89,7 +89,7 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
   - macOS 构建安装 `requirements-macos.txt`（mlx-whisper）并以
     `--collect-all mlx mlx_whisper numba` 内嵌 Metal 引擎；
   - Windows 构建安装 `requirements-windows.txt`（nvidia-cublas/cudnn-cu12），
-    经 `tools/collect_cuda_dlls.py` 收集 DLL 后以 `--add-binary` 内嵌，
+    经 `tools/collect_native_libs.py` 收集 DLL 后以 `--add-binary` 内嵌，
     启动时自动把解压目录加入 DLL 搜索路径；
 - **双轨发布**：推送 `v*` 标签 → 正式 Release；推送 main → 滚动 nightly 预发布
   （覆盖上一次，标题带 commit 哈希）；PR 只测试不发布。
@@ -103,12 +103,14 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
    - `○` 开头为内置推荐项，尚未下载；
    - 点击「搜索 / 下载模型…」可在 **hf-mirror.com（HuggingFace 国内镜像）**
      检索任意语音识别模型（优先展示 CTranslate2 格式，即 faster-whisper 可用格式），
-     选中后流式下载并显示进度，支持取消与断点续传。
+     选中后**多文件并行下载**并显示进度，支持取消与断点续传（下载完成自动校验完整性）。
 3. **转写设置**：识别语言（自动/中/英…）、输出模式（转写原文字 / 翻译为英语）、
    推理精细度（beam=1 快速 / beam=5 均衡）、VAD 静音过滤。
 4. **开始转写**：后台线程推理，逐段实时显示在「分段预览」表格（带时间戳），
-   「纯文本」页合并为连续文本。
-5. **导出**：TXT / SRT 字幕 / Markdown / Word 文档，
+   「纯文本」页合并为连续文本。分段结果按批刷新（80ms / 每 40 段），长音频不卡顿。
+5. **批量转写（可选）**：点击「批量转写文件夹…」选择目录，按文件名顺序转写其中
+   所有视音频文件，逐个自动导出为 TXT 到导出目录；**整批共用一次模型加载**。
+6. **导出**：TXT / SRT 字幕 / Markdown / Word 文档，
    默认保存到媒体文件同目录（`<文件名>_转写稿.<ext>`），也可自选路径。
 
 ## 模型建议
@@ -139,6 +141,18 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
 - 经验法则：tiny/base 级别模型 CPU 更快；**medium 及以上模型用 GPU 引擎更划算**；
 - 批量推理勾选框仅对 CPU / NVIDIA 引擎生效（Metal 本身已是并行推理）。
 
+## 性能优化
+
+| 优化 | 说明 |
+|------|------|
+| 模型缓存 | 进程内按 `(模型路径, 设备, 精度)` 缓存已加载模型（上限 1，切换时释放）；**连续转写 / 批量转写时省去每次重复加载权重**（CPU 大模型加载可达 10s+） |
+| 分段批量刷新 | 转写分段先入缓冲，按 80ms 定时器或每 40 段批量写入表格，并用 `setUpdatesEnabled` 关闭重绘；长音频（数百段）UI 不再卡顿 |
+| 并行下载 | 模型仓库多文件用线程池并行下载（默认 4 并发），小文件（config/vocab）不再逐个排队 |
+| 精简请求 | 去掉每文件一次 `HEAD` 探测，改为从 `GET` 响应头 / `Content-Range` 直接取总大小，减少一轮 RTT |
+| 续传健壮性 | 按响应码区分 206（续传）/ 200（服务器忽略 Range → 截断重下，修复进度 >100% 的计数 bug）/ 416（已完成跳过）；下载完成后**校验文件大小**，不符即报错 |
+| mlx 时长准确 | Metal 引擎改用 PyAV 探测媒体真实时长，替代原先"末段结束时间"的近似值 |
+| 多语种提示词 | `initial_prompt` 按所选语言动态选择（中/英/日/韩/德/法/西），自动检测时沿用中文提示，避免统一中文提示对非中文音频产生偏置 |
+
 ## 技术要点
 
 - **引擎**：faster-whisper（CTranslate2 推理），int8 量化，VAD 过滤静音，
@@ -155,9 +169,9 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
 - **Q: 模型下载很慢或失败？** 镜像站高峰期可能波动，程序支持断点续传，重试即可继续。
 - **Q: 找不到已下载的模型？** 点击「刷新」重新扫描 `models/` 目录；
   只有含 `model.bin` 的目录才会被识别为完整模型。
-- **Q: 想用 GPU？** 当前版本固定 CPU + int8（跨平台零依赖）；
-  如需 CUDA，可将 `workers.py` 中 `WhisperModel(...)` 的参数改为
-  `device="cuda", compute_type="float16"`。
+- **Q: 想用 GPU？** 在「引擎」下拉框选择 NVIDIA GPU（需系统安装 cuBLAS/cuDNN CUDA 12）
+  或 Apple Metal（需 `pip install mlx-whisper`）；默认「自动识别」会自动选最佳架构，
+  CUDA 加载失败时自动回退 CPU。
 
 ## 关于 FFmpeg 的说明（无需手动安装）
 

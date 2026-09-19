@@ -9,6 +9,8 @@
 """
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 import requests
@@ -17,6 +19,10 @@ from . import settings
 from .config import HF_MIRROR
 
 TIMEOUT = 15
+
+# 并行下载并发数：模型仓库通常含多个文件（权重 + config/vocab 等小文件），
+# 适度并发可显著缩短总耗时；过高可能触发镜像站限流，默认 4。
+MAX_DOWNLOAD_WORKERS = 4
 
 
 @dataclass
@@ -103,47 +109,86 @@ def get_model_files(repo_id: str) -> list:
     return files
 
 
-def download_model(repo_id: str, progress_cb=None, cancel_check=None) -> str:
-    """下载整个模型到 models/<repo> 目录。
-
-    progress_cb(filename, downloaded_bytes, total_bytes)  用于进度上报。
-    cancel_check() 返回 True 时中止下载并抛出 CancelledError。
-    优先跳过已存在且大小一致的文件，支持断点续传（Range 请求）。
-    """
-    files = get_model_files(repo_id)
-    # 只下载转写必需的文件，跳过 README/LICENSE 等无关大文件风险
+def _required_files(repo_id: str) -> list:
+    """返回需要下载的文件列表（跳过 README/LICENSE 等无关文件）。"""
     skip_pattern = re.compile(r"^(README|LICENSE|NOTICE|CONTRIBUTING)", re.I)
-    files = [f for f in files if not skip_pattern.match(os.path.basename(f))]
+    files = get_model_files(repo_id)
+    return [f for f in files if not skip_pattern.match(os.path.basename(f))]
 
-    dest_dir = ModelInfo(repo_id).local_dir
-    os.makedirs(dest_dir, exist_ok=True)
+
+def _content_range_total(header) -> int:
+    """解析 Content-Range 头中的总长度。
+
+    兼容两种写法：
+      - 206 响应：`bytes 100-999/1000` → 1000
+      - 416 响应：`bytes */1000`       → 1000
+    解析失败返回 None。
+    """
+    if not header or "/" not in header:
+        return None
+    tail = header.rsplit("/", 1)[1].strip()
+    return int(tail) if tail.isdigit() else None
+
+
+def _make_reporter(progress_cb):
+    """把进度回调包装为线程安全版本（并行下载时多线程会并发调用）。"""
+    if progress_cb is None:
+        return lambda *_: None
+    lock = threading.Lock()
+
+    def _report(filename, done, total):
+        with lock:
+            progress_cb(filename, done, total)
+
+    return _report
+
+
+def _download_file(repo_id: str, filename: str, dest_dir: str,
+                   report, cancel_check) -> None:
+    """下载单个文件，支持断点续传与完成后大小校验。
+
+    - 本地已有部分内容 → 带 Range 请求续传（服务器返回 206）
+    - 服务器忽略 Range 返回 200 → 截断重下（避免进度超 100%）
+    - 返回 416（断点位置越界）→ 本地已完整则跳过，异常则删除重下
+    - 下载完成后校验文件大小与远端一致，不符则报错
+    """
+    dest_path = os.path.join(dest_dir, filename)
+    parent = os.path.dirname(dest_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    url = f"{HF_MIRROR}/{repo_id}/resolve/main/{filename}"
+    local_size = os.path.getsize(dest_path) if os.path.isfile(dest_path) else 0
+    headers = {"Range": f"bytes={local_size}-"} if local_size > 0 else {}
 
     session = requests.Session()
-    for filename in files:
-        if cancel_check and cancel_check():
-            raise CancelledError()
-        dest_path = os.path.join(dest_dir, filename)
-        os.makedirs(os.path.dirname(dest_path) or dest_dir, exist_ok=True)
-        url = f"{HF_MIRROR}/{repo_id}/resolve/main/{filename}"
+    try:
+        with session.get(url, headers=headers, stream=True, timeout=60,
+                         allow_redirects=True) as resp:
+            if resp.status_code == 416:
+                # 断点位置越界：本地文件已达（或超过）远端大小
+                total = _content_range_total(resp.headers.get("content-range"))
+                if total is None or local_size == total:
+                    report(filename, local_size, local_size)   # 视为已完成
+                    return
+                # 本地文件异常偏大 → 删除后全量重下一次
+                os.remove(dest_path)
+                return _download_file(repo_id, filename, dest_dir, report, cancel_check)
 
-        # 已存在且远端大小一致 → 跳过（断点续跑）
-        remote_size = _remote_size(session, url)
-        if os.path.isfile(dest_path) and remote_size and os.path.getsize(dest_path) == remote_size:
-            if progress_cb:
-                progress_cb(filename, remote_size, remote_size)
-            continue
-
-        headers = {}
-        mode = "wb"
-        resume_from = 0
-        if os.path.isfile(dest_path) and remote_size and os.path.getsize(dest_path) < remote_size:
-            resume_from = os.path.getsize(dest_path)
-            headers["Range"] = f"bytes={resume_from}-"
-            mode = "ab"
-
-        with session.get(url, headers=headers, stream=True, timeout=60, allow_redirects=True) as resp:
             resp.raise_for_status()
-            total = remote_size or int(resp.headers.get("content-length", 0) or 0) + resume_from
+            if resp.status_code == 206:
+                mode, resume_from = "ab", local_size
+                total = _content_range_total(resp.headers.get("content-range"))
+                if total is None:   # 无 Content-Range → 用剩余长度推算
+                    total = resume_from + int(resp.headers.get("content-length", 0) or 0)
+            else:
+                # 服务器未按 Range 返回（200）→ 从头写入，避免重复计数
+                mode, resume_from = "wb", 0
+                total = int(resp.headers.get("content-length", 0) or 0)
+
+            if mode == "ab" and total and resume_from >= total:
+                report(filename, total, total)
+                return
+
             done = resume_from
             with open(dest_path, mode) as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
@@ -152,19 +197,49 @@ def download_model(repo_id: str, progress_cb=None, cancel_check=None) -> str:
                     if chunk:
                         f.write(chunk)
                         done += len(chunk)
-                        if progress_cb:
-                            progress_cb(filename, done, total)
+                        report(filename, done, total)
+
+        # 完成校验：已知总大小时必须完全一致，否则视为下载失败
+        if total and os.path.getsize(dest_path) != total:
+            raise IOError(
+                f"下载校验失败：{filename} 期望 {total} 字节，"
+                f"实际 {os.path.getsize(dest_path)} 字节（可重试续传）")
+    finally:
+        session.close()
+
+
+def download_model(repo_id: str, progress_cb=None, cancel_check=None,
+                   max_workers: int = MAX_DOWNLOAD_WORKERS) -> str:
+    """并行下载整个模型到 models/<repo> 目录。
+
+    progress_cb(filename, downloaded_bytes, total_bytes)  用于进度上报（线程安全）。
+    cancel_check() 返回 True 时中止下载并抛出 CancelledError。
+    多文件并行下载；每个文件支持断点续传（Range）与完成后大小校验。
+    """
+    files = _required_files(repo_id)
+    dest_dir = ModelInfo(repo_id).local_dir
+    os.makedirs(dest_dir, exist_ok=True)
+    if not files:
+        return dest_dir
+
+    report = _make_reporter(progress_cb)
+    errors = []
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        futures = [ex.submit(_download_file, repo_id, fn, dest_dir, report, cancel_check)
+                   for fn in files]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except BaseException as e:   # noqa: BLE001 - 收集后统一处理
+                errors.append(e)
+
+    # 取消优先于其它错误抛出；其余取首个错误
+    for e in errors:
+        if isinstance(e, CancelledError):
+            raise e
+    if errors:
+        raise errors[0]
     return dest_dir
-
-
-def _remote_size(session: requests.Session, url: str):
-    """通过 HEAD 请求获取远端文件大小（失败返回 None，不阻塞下载）。"""
-    try:
-        r = session.head(url, timeout=TIMEOUT, allow_redirects=True)
-        size = r.headers.get("content-length")
-        return int(size) if size else None
-    except Exception:
-        return None
 
 
 class CancelledError(Exception):

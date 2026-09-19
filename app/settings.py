@@ -9,6 +9,7 @@
 备份与在测试中隔离（指向临时文件即可）。
 """
 import os
+import sys
 
 from PySide6.QtCore import QSettings
 
@@ -37,7 +38,7 @@ def set_settings_file(path):
 def default_models_dir() -> str:
     """默认模型目录：开发态用项目内 models/；打包态 exe/app 目录可能只读
     （如 Program Files / /Applications），改用用户主目录。"""
-    if getattr(__import__("sys"), "frozen", False):
+    if getattr(sys, "frozen", False):
         return os.path.join(os.path.expanduser("~"), "FastWhisper", "models")
     return os.path.join(APP_ROOT, "models")
 

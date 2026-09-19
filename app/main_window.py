@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""主窗口：导入媒体 → 选择模型 → 转写 → 预览 → 导出。"""
+"""主窗口：导入媒体 → 选择模型 → 转写（单文件 / 批量文件夹）→ 预览 → 导出。"""
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStatusBar,
@@ -16,7 +16,8 @@ from .exporter import export_docx, export_markdown, export_srt, export_txt
 from .theme import TEXT_SECOND
 from .widgets import Card, DropArea, ModelSearchDialog, SettingsDialog
 from .workers import (
-    TranscribeWorker, check_media_decode, list_local_models, local_model_kind,
+    BatchTranscribeWorker, TranscribeWorker, check_media_decode,
+    list_local_models, local_model_kind, scan_media_files,
 )
 
 LANGS = [("自动检测", "auto"), ("中文", "zh"), ("英语", "en"), ("日语", "ja"),
@@ -37,6 +38,13 @@ class MainWindow(QMainWindow):
         self.segments = []
         self.info = {}
         self.worker = None
+        self.batch_worker = None
+        self._batch_total = 0          # >0 表示批量模式进行中（用于状态文案）
+        # 分段结果批量刷新的缓冲：避免逐段插入表格导致长音频卡顿
+        self._pending_rows = []
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(80)
+        self._flush_timer.timeout.connect(self._flush_rows)
 
         self._build_ui()
         self.refresh_models()
@@ -143,11 +151,20 @@ class MainWindow(QMainWindow):
 
         # ---- 3. 转写 ----
         card3 = Card()
+        action_row = QHBoxLayout()
         self.start_btn = QPushButton("开始转写")
         self.start_btn.setObjectName("primaryButton")
         self.start_btn.setEnabled(False)
         self.start_btn.clicked.connect(self.start_transcribe)
-        card3.add(self.start_btn)
+        action_row.addWidget(self.start_btn, 1)
+
+        self.batch_btn = QPushButton("批量转写文件夹…")
+        self.batch_btn.setToolTip(
+            "选择一个文件夹，按文件名顺序转写其中所有视音频文件，"
+            "逐个自动导出为 TXT 到导出目录；模型只加载一次")
+        self.batch_btn.clicked.connect(self.start_batch_transcribe)
+        action_row.addWidget(self.batch_btn)
+        card3.layout().addLayout(action_row)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)   # 转写阶段为未知总量 → 流水动画
@@ -300,24 +317,29 @@ class MainWindow(QMainWindow):
             + (f" · 导出目录 {settings.get_export_dir()}" if settings.get_export_dir() else ""))
 
     def _update_start_state(self):
+        busy = ((self.worker is not None and self.worker.isRunning())
+                or (self.batch_worker is not None and self.batch_worker.isRunning()))
         self.start_btn.setEnabled(
-            bool(self.media_path) and bool(self.model_combo.currentData())
-            and (self.worker is None or not self.worker.isRunning())
+            bool(self.media_path) and bool(self.model_combo.currentData()) and not busy
         )
+        self.batch_btn.setEnabled(bool(self.model_combo.currentData()) and not busy)
 
     # ================= 转写 =================
-    def start_transcribe(self):
-        # 预检：内置 FFmpeg（PyAV）是否可用，不可用给出清晰指引而非裸报错
+    def _preflight(self):
+        """公共预检：解码器可用性、引擎可用性、模型架构匹配。
+
+        通过则返回 (model_sel, engine)；任一环节不满足返回 None（已弹窗提示）。
+        """
         decode_problem = check_media_decode()
         if decode_problem:
             QMessageBox.critical(self, "解码器不可用", decode_problem)
-            return
+            return None
 
         model_sel = self.model_combo.currentData()
         engine = self._current_engine()
-        if not self.media_path or not model_sel:
-            QMessageBox.warning(self, "提示", "请先选择媒体文件与模型")
-            return
+        if not model_sel:
+            QMessageBox.warning(self, "提示", "请先选择模型")
+            return None
 
         if self.engine_combo.currentData() == "mlx-disabled":
             QMessageBox.information(
@@ -325,14 +347,14 @@ class MainWindow(QMainWindow):
                 "mlx-whisper 未安装到当前虚拟环境。\n"
                 "安装命令：\n"
                 ".venv/bin/pip install mlx-whisper")
-            return
+            return None
         if self.engine_combo.currentData() == "cuda-disabled":
             QMessageBox.information(
                 self, "未检测到 NVIDIA GPU",
                 "未检测到可用的 CUDA 环境。\n"
                 "需要 NVIDIA 显卡并安装 cuBLAS/cuDNN（CUDA 12），"
                 "或改用 CPU / Metal 引擎。")
-            return
+            return None
 
         # 校验模型格式与引擎匹配（防止误用对方架构的模型）
         if os.path.isdir(model_sel):
@@ -342,15 +364,28 @@ class MainWindow(QMainWindow):
                     self, "模型架构不匹配",
                     f"所选模型是 {kind.upper()} 格式，与当前引擎（{engine}）不匹配。\n"
                     "请切换引擎，或在「搜索 / 下载模型」中下载对应架构的模型。")
-                return
+                return None
         elif model_sel in ENGINES[engine]["builtin"]:
             QMessageBox.information(
                 self, "需要先下载模型",
                 "当前选中的模型尚未下载。\n请点击「搜索 / 下载模型…」，在列表中选中它并下载。")
+            return None
+
+        return model_sel, engine
+
+    def start_transcribe(self):
+        if not self.media_path:
+            QMessageBox.warning(self, "提示", "请先选择媒体文件")
             return
+        pf = self._preflight()
+        if not pf:
+            return
+        model_sel, engine = pf
 
         self._clear_results()
+        self._batch_total = 0
         self.start_btn.setEnabled(False)
+        self.batch_btn.setEnabled(False)
         self.progress.setVisible(True)
         self.status_label.setText("准备中…")
 
@@ -365,14 +400,86 @@ class MainWindow(QMainWindow):
             batched=(self._engine_kind(engine) == "fw"
                      and self.batched_check.isChecked()),
         )
-        self.worker.model_loading.connect(lambda: None)
         self.worker.progress_text.connect(self.status_label.setText)
         self.worker.segment_ready.connect(self._on_segment)
         self.worker.finished_ok.connect(self._on_transcribe_ok)
         self.worker.failed.connect(self._on_transcribe_fail)
         self.worker.start()
 
+    # ================= 批量转写 =================
+    def start_batch_transcribe(self):
+        """选择文件夹 → 顺序转写其中所有媒体文件 → 逐个自动导出为 TXT。"""
+        pf = self._preflight()
+        if not pf:
+            return
+        model_sel, engine = pf
+
+        from . import settings
+        start_dir = settings.get_export_dir() or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "选择要批量转写的文件夹", start_dir)
+        if not folder:
+            return
+        files = scan_media_files(folder)
+        if not files:
+            QMessageBox.information(
+                self, "未找到媒体文件",
+                "该文件夹下没有可转写的视音频文件（仅扫描一级目录）。")
+            return
+        out_dir = settings.get_export_dir() or folder
+
+        self._clear_results()
+        self._batch_total = len(files)
+        self.start_btn.setEnabled(False)
+        self.batch_btn.setEnabled(False)
+        self.progress.setRange(0, len(files))
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self.status_label.setText(f"批量转写 {len(files)} 个文件 → {out_dir}")
+
+        self.batch_worker = BatchTranscribeWorker(
+            files, model_sel, out_dir,
+            engine=engine,
+            language=self.lang_combo.currentData(),
+            task=self.task_combo.currentData(),
+            beam_size=self.beam_combo.currentData(),
+            use_vad=self.vad_check.isChecked(),
+            batched=(self._engine_kind(engine) == "fw"
+                     and self.batched_check.isChecked()),
+        )
+        self.batch_worker.file_started.connect(self._on_batch_file_started)
+        self.batch_worker.segment_ready.connect(self._on_segment)
+        self.batch_worker.file_finished.connect(self._on_batch_file_finished)
+        self.batch_worker.file_failed.connect(self._on_batch_file_failed)
+        self.batch_worker.progress_text.connect(self.status_label.setText)
+        self.batch_worker.finished_ok.connect(self._on_batch_done)
+        self.batch_worker.start()
+
+    def _on_batch_file_started(self, idx, total, path):
+        self._clear_results()
+        self.status_label.setText(
+            f"[{idx}/{total}] 正在转写：{os.path.basename(path)}")
+
+    def _on_batch_file_finished(self, idx, path, export_path):
+        self.progress.setValue(self.progress.value() + 1)
+        self.status_label.setText(f"✓ 已导出：{os.path.basename(export_path)}")
+
+    def _on_batch_file_failed(self, idx, path, err):
+        self.progress.setValue(self.progress.value() + 1)
+        self.status_label.setText(f"✗ 失败：{os.path.basename(path)} — {err}")
+
+    def _on_batch_done(self, done, total):
+        self._flush_rows()
+        self._batch_total = 0
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 0)   # 恢复单文件模式的流水动画
+        self._update_start_state()
+        # 表格中保留最后一个文件的分段，允许手动再导出
+        self._set_export_enabled(bool(self.segments))
+        self.status_label.setText(f"批量转写完成：成功 {done} / {total} 个文件")
+
     def _clear_results(self):
+        self._flush_timer.stop()
+        self._pending_rows = []
         self.segments = []
         self.info = {}
         self.seg_table.setRowCount(0)
@@ -380,19 +487,43 @@ class MainWindow(QMainWindow):
         self._set_export_enabled(False)
 
     def _on_segment(self, start: float, end: float, text: str):
+        # 先入缓冲，由定时器按批刷新到表格，避免逐段插入造成长音频卡顿
         self.segments.append({"start": start, "end": end, "text": text})
-        row = self.seg_table.rowCount()
-        self.seg_table.insertRow(row)
-        for col, val in enumerate([_fmt(start), _fmt(end), text]):
-            item = QTableWidgetItem(val)
-            if col < 2:
-                item.setForeground(Qt.GlobalColor.gray)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.seg_table.setItem(row, col, item)
-        self.seg_table.scrollToBottom()
-        self.status_label.setText(f"正在转写… 已完成 {row + 1} 段")
+        self._pending_rows.append((start, end, text))
+        if len(self._pending_rows) >= 40:
+            self._flush_rows()
+        elif not self._flush_timer.isActive():
+            self._flush_timer.start()
+        # 批量模式下由批量流程统一维护状态文案，避免来回覆盖
+        if not self._batch_total:
+            self.status_label.setText(
+                f"正在转写… 已完成 {self.seg_table.rowCount() + len(self._pending_rows)} 段")
+
+    def _flush_rows(self):
+        """把缓冲的分段一次性写入表格（关闭重绘 → 批量插入 → 恢复重绘）。"""
+        if not self._pending_rows:
+            self._flush_timer.stop()
+            return
+        rows, self._pending_rows = self._pending_rows, []
+        table = self.seg_table
+        base = table.rowCount()
+        table.setUpdatesEnabled(False)
+        try:
+            table.setRowCount(base + len(rows))
+            for i, (start, end, text) in enumerate(rows):
+                r = base + i
+                for col, val in enumerate([_fmt(start), _fmt(end), text]):
+                    item = QTableWidgetItem(val)
+                    if col < 2:
+                        item.setForeground(Qt.GlobalColor.gray)
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table.setItem(r, col, item)
+        finally:
+            table.setUpdatesEnabled(True)
+        table.scrollToBottom()
 
     def _on_transcribe_ok(self, segments, info):
+        self._flush_rows()
         self.info = info or {}
         self.progress.setVisible(False)
         self._update_start_state()
@@ -404,6 +535,7 @@ class MainWindow(QMainWindow):
         self._set_export_enabled(bool(segments))
 
     def _on_transcribe_fail(self, msg):
+        self._flush_rows()
         self.progress.setVisible(False)
         self._update_start_state()
         self.status_label.setText(f"转写失败：{msg}")
@@ -459,7 +591,8 @@ class MainWindow(QMainWindow):
 
     # ================= 关闭 =================
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(1500)
+        for w in (self.worker, self.batch_worker):
+            if w and w.isRunning():
+                w.cancel()
+                w.wait(1500)
         event.accept()
