@@ -90,6 +90,45 @@ def _probe_duration(path: str) -> float:
     return 0.0
 
 
+# Whisper 系列模型固定要求的采样率
+WHISPER_SAMPLE_RATE = 16000
+
+
+class NoAudioStreamError(Exception):
+    """媒体文件不含音频轨道（可明确提示用户，区别于其它解码错误）。"""
+
+
+def decode_audio_pyav(path: str, sample_rate: int = WHISPER_SAMPLE_RATE):
+    """用随包内置的 PyAV 把媒体解码为**单声道 float32 波形**（幅值 [-1, 1]）。
+
+    背景：mlx_whisper 自带的 load_audio 通过 subprocess 调用系统 `ffmpeg` 命令行，
+    打包成 .app/.exe 后 PATH 通常不含 ffmpeg，会抛
+    `FileNotFoundError: [Errno 2] No such file or directory: 'ffmpeg'`。
+    本项目已内置 PyAV（自带 FFmpeg 共享库），这里统一用它解码，彻底摆脱
+    对系统 ffmpeg 可执行文件的依赖，与「无需手动安装 FFmpeg」的设计一致。
+
+    返回一维 float32 ndarray；无音频流时抛 NoAudioStreamError。
+    注意：PyAV 的解码错误（如 InvalidDataError）继承自 ValueError，调用方需
+    用 `except NoAudioStreamError` 单独区分，切勿用 ValueError 兜底。
+    """
+    import numpy as np
+    import av
+
+    with av.open(path) as container:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            raise NoAudioStreamError("媒体文件中没有可用的音频流")
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=sample_rate)
+        frames = []
+        for frame in container.decode(stream):
+            frames.extend(resampler.resample(frame))
+        frames.extend(resampler.resample(None))   # 冲刷重采样器尾帧
+    if not frames:
+        return np.zeros(0, dtype=np.float32)
+    waveform = np.concatenate([f.to_ndarray().reshape(-1) for f in frames])
+    return waveform.astype(np.float32, copy=False)
+
+
 # ==================== 转写核心（与线程解耦） ====================
 def _pct_reporter(on_progress, duration: float):
     """构造把「已处理到的时间点」换算为百分比并去重的回调。
@@ -208,18 +247,33 @@ def _transcribe_mlx(media_path, model_path, lang, task, on_segment, on_status,
                     on_progress, cancel_check):
     """mlx-whisper 路径（Apple Metal GPU）。
 
-    注意：mlx_whisper.transcribe 一次性返回全部结果，不提供流式进度，
-    故本路径不使用 on_progress（界面保持不确定进度动画）。
+    - 音频解码走内置 PyAV（规避 mlx 对系统 ffmpeg 命令行的依赖）
+    - 注意：mlx_whisper.transcribe 一次性返回全部结果，不提供流式进度，
+      故本路径不使用 on_progress（界面保持不确定进度动画）。
     """
     try:
         import mlx_whisper
     except ImportError as e:
         raise RuntimeError(f"缺少 mlx-whisper（Metal 引擎）：{e}")
 
+    # 优先用内置 PyAV 解码为波形传入，避免依赖系统 ffmpeg 可执行文件
+    # （mlx_whisper 传文件路径时会 subprocess 调用 `ffmpeg`，打包后常缺失）
+    if on_status:
+        on_status("正在用内置解码器解码音频 …")
+    try:
+        audio = decode_audio_pyav(media_path)
+    except NoAudioStreamError:
+        raise                       # 「无音频流」明确上报，给准确提示
+    except (ImportError, ModuleNotFoundError):
+        audio = None                # 内置解码器不可用 → 回退为传路径（交由 mlx 处理）
+    audio_input = audio if (audio is not None and getattr(audio, "size", 0)) else media_path
+
+    if cancel_check and cancel_check():
+        raise CancelledError()
     if on_status:
         on_status("正在加载模型到 Metal GPU …")
     result = mlx_whisper.transcribe(
-        media_path, path_or_hf_repo=model_path,
+        audio_input, path_or_hf_repo=model_path,
         language=lang, task=task, verbose=False)
     if cancel_check and cancel_check():
         raise CancelledError()
@@ -435,6 +489,18 @@ def _friendly_media_error(e: Exception) -> str:
     """把底层解码/转写异常翻译成用户能看懂的提示。"""
     msg = str(e)
     type_name = type(e).__name__
+    low = msg.lower()
+    # MLX 引擎旧路径会调用系统 ffmpeg 命令行；PATH 中缺失时给出可操作指引
+    if "ffmpeg" in low and (type_name.startswith("FileNotFoundError")
+                            or "no such file" in low or "not found" in low):
+        return (
+            "音频解码器不可用：未找到 ffmpeg 可执行文件。\n"
+            "本程序已优先使用内置解码器；若仍出现此提示，请改用 CPU / NVIDIA 引擎，"
+            "或安装 ffmpeg（macOS: brew install ffmpeg，Windows 见 ffmpeg.org）。\n"
+            f"详细信息：{msg}"
+        )
+    if "没有可用的音频流" in msg:
+        return f"该文件不包含音频轨道，无法转写。\n{msg}"
     # PyAV 打不开文件：路径不存在、容器/编码不支持、文件损坏
     if type_name.startswith("FileNotFoundError") or "No such file" in msg:
         return f"无法打开媒体文件：路径不存在或文件已被移动。\n{msg}"

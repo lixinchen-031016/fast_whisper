@@ -456,3 +456,119 @@ def test_search_worker_success_and_failure(qapp, monkeypatch):
     w2.failed.connect(err.append, Qt.ConnectionType.DirectConnection)
     w2.start(); w2.wait(2000)
     assert err and "boom" in err[0]
+
+
+# ==================== 第三轮：MLX 绕开系统 ffmpeg ====================
+def _write_wav(path, seconds=0.5, rate=16000, freq=8.0):
+    """生成一段可被 PyAV 解码的单声道 16k WAV（不依赖任何外部可执行文件）。"""
+    import math
+    import struct
+    import wave
+
+    n = int(seconds * rate)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(
+            struct.pack("<h", int(3000 * math.sin(i / freq))) for i in range(n)))
+    return str(path)
+
+
+def test_decode_audio_pyav(tmp_path):
+    """内置 PyAV 解码：单声道 float32、16k 采样、幅值归一化到 [-1,1]。"""
+    import numpy as np
+
+    wav = _write_wav(tmp_path / "a.wav", seconds=0.5, rate=16000)
+    audio = workers.decode_audio_pyav(wav)
+    assert isinstance(audio, np.ndarray)
+    assert audio.dtype == np.float32
+    assert abs(audio.shape[0] - 8000) <= 2          # 0.5s * 16000
+    assert float(abs(audio).max()) <= 1.0
+
+
+def test_mlx_path_passes_waveform_not_path(tmp_path, monkeypatch):
+    """MLX 引擎应把 PyAV 解码出的波形（ndarray）传给 mlx_whisper，而非文件路径。
+
+    这正是修复 `No such file or directory: 'ffmpeg'` 的关键——
+    mlx_whisper 收到字符串时会 subprocess 调用系统 ffmpeg。
+    """
+    import sys
+    import types
+
+    import numpy as np
+
+    wav = _write_wav(tmp_path / "b.wav")
+
+    captured = {}
+
+    def _fake_transcribe(audio, path_or_hf_repo=None, language=None, task=None,
+                         verbose=None, **kw):
+        captured["audio"] = audio
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": " 你好 "}],
+                "language": "zh"}
+
+    fake = types.ModuleType("mlx_whisper")
+    fake.transcribe = _fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+
+    segs, info = workers.transcribe_media(wav, "/model", engine="mlx", language="zh")
+    assert [s["text"] for s in segs] == ["你好"]
+    assert info["engine"] == "mlx"
+    assert isinstance(captured["audio"], np.ndarray)   # 传的是波形，不是路径
+
+
+def test_mlx_path_falls_back_to_path_when_decoder_unavailable(tmp_path, monkeypatch):
+    """内置解码器不可用（缺 PyAV）时回退为传路径，保证不回归。"""
+    import sys
+    import types
+
+    captured = {}
+
+    def _fake_transcribe(audio, **kw):
+        captured["audio"] = audio
+        return {"segments": [], "language": "?"}
+
+    fake = types.ModuleType("mlx_whisper")
+    fake.transcribe = _fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+
+    def _no_decoder(*a, **k):
+        raise ImportError("no module named av")
+
+    monkeypatch.setattr(workers, "decode_audio_pyav", _no_decoder)
+    workers.transcribe_media("/tmp/whatever.mp4", "/model", engine="mlx")
+    assert captured["audio"] == "/tmp/whatever.mp4"    # 回退为路径
+
+
+def test_mlx_path_surfaces_decode_error_for_invalid_media(tmp_path, monkeypatch):
+    """真正的解码错误（文件损坏/格式不支持）应直接抛出，而非误判为『无音频流』。
+
+    回归保护：PyAV 的 InvalidDataError 继承自 ValueError，不能用 ValueError 兜底。
+    """
+    import sys
+    import types
+
+    fake = types.ModuleType("mlx_whisper")
+    fake.transcribe = lambda *a, **k: {"segments": [], "language": "?"}
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"definitely not media")
+    with pytest.raises(Exception) as ei:
+        workers.transcribe_media(str(bad), "/model", engine="mlx")
+    assert not isinstance(ei.value, workers.NoAudioStreamError)
+
+
+def test_friendly_error_ffmpeg_missing():
+    """ffmpeg 缺失要给出准确提示，而非误导性的『路径不存在』。"""
+    err = FileNotFoundError("[Errno 2] No such file or directory: 'ffmpeg'")
+    msg = workers._friendly_media_error(err)
+    assert "ffmpeg" in msg
+    assert "解码器不可用" in msg
+    assert "路径不存在" not in msg
+
+
+def test_friendly_error_no_audio_stream():
+    msg = workers._friendly_media_error(ValueError("媒体文件中没有可用的音频流"))
+    assert "音频轨道" in msg

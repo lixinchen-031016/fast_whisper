@@ -169,6 +169,8 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
 | 导出健壮性 | 导出包裹异常处理（磁盘满 / 权限不足 / 缺 python-docx 时弹窗提示而非崩溃）；保存路径自动补扩展名 |
 | 空段清洗 | 导出前去除分段首尾空白并丢弃空段，避免 TXT 空行与空字幕 |
 | 已下载判定修正 | 「已下载」状态同时识别 CTranslate2（`model.bin`）与 MLX（`*.safetensors`）格式，修复 MLX 模型永远显示未下载的问题 |
+| MLX 内置解码 | Metal 引擎改用**内置 PyAV 解码为波形**再送入模型，不再依赖系统 `ffmpeg` 命令行（修复打包后 `No such file or directory: 'ffmpeg'`） |
+| 错误提示纠正 | ffmpeg 缺失 / 无音频轨道等场景给出准确可操作的提示，不再统一误报为「路径不存在」 |
 | 缓存一致性 | 切换模型目录时清空进程内模型缓存，释放旧目录已加载的模型 |
 
 ## 技术要点
@@ -196,6 +198,9 @@ pip install -r requirements-windows.txt  # Windows：CUDA 12 运行库（NVIDIA 
 视频/音频解码使用 **PyAV 自带的 FFmpeg 共享库**——安装包已内置，**无需用户
 单独安装 FFmpeg 或配置环境变量**。双击即可转写视频。
 
+- **两种引擎都用内置解码**：CPU/NVIDIA（faster-whisper）走 PyAV；
+  Apple Metal（mlx-whisper）默认会调用系统 `ffmpeg` 命令行，本程序已改为
+  先用内置 PyAV 解码为波形再送入模型，**同样无需安装 ffmpeg**；
 - 启动转写前程序会自动预检解码器，不可用时弹窗给出明确指引；
 - Windows 安装包构建时经 `tools/collect_native_libs.py` 将 FFmpeg DLL
   （以及 CUDA 运行库）嵌入 exe；macOS .app 由 PyInstaller 的 av 钩子打包 dylibs；
