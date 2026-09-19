@@ -3,7 +3,7 @@
 """可复用界面组件：圆角卡片、拖放导入区、模型搜索对话框。"""
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QDialog,
@@ -12,6 +12,23 @@ from PySide6.QtWidgets import (
 
 from . import model_manager
 from .theme import ACCENT, BORDER, TEXT, TEXT_SECOND
+
+
+class SearchWorker(QThread):
+    """模型搜索线程：网络请求放后台，避免镜像站响应慢时界面冻结。"""
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, query: str, engine: str = None, parent=None):
+        super().__init__(parent)
+        self.query = query
+        self.engine = engine
+
+    def run(self):
+        try:
+            self.finished_ok.emit(model_manager.search_models(self.query, engine=self.engine))
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class Card(QFrame):
@@ -115,6 +132,7 @@ class ModelSearchDialog(QDialog):
         self.setWindowTitle("搜索并下载模型 — hf-mirror.com")
         self.resize(720, 560)
         self._worker = None
+        self._search_worker = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
@@ -199,19 +217,25 @@ class ModelSearchDialog(QDialog):
         arch = self._arch_kind()
         # mlx 架构在搜索 API 层面用 mlx 过滤，cpu 架构沿用原关键词并后置过滤
         api_query = query if arch != "mlx" else f"{query} mlx" if "mlx" not in query.lower() else query
+        if self._search_worker and self._search_worker.isRunning():
+            return   # 上一次搜索未结束，避免并发请求
         self.status_label.setText(f"正在搜索“{api_query}”…")
         self.search_btn.setEnabled(False)
-        try:
-            results = model_manager.search_models(api_query, engine=arch)
-        except Exception as e:
-            self.status_label.setText(f"搜索失败：{e}（请检查网络）")
-            self.search_btn.setEnabled(True)
-            return
+        self._search_worker = SearchWorker(api_query, arch)
+        self._search_worker.finished_ok.connect(self._on_search_ok)
+        self._search_worker.failed.connect(self._on_search_fail)
+        self._search_worker.start()
+
+    def _on_search_ok(self, results):
         self.search_btn.setEnabled(True)
-        fmt = "MLX" if arch == "mlx" else "CTranslate2"
+        fmt = "MLX" if self._arch_kind() == "mlx" else "CTranslate2"
         self.status_label.setText(
             f"找到 {len(results)} 个模型（按下载量排序，{fmt} 格式优先）")
         self._fill_table(results)
+
+    def _on_search_fail(self, msg):
+        self.search_btn.setEnabled(True)
+        self.status_label.setText(f"搜索失败：{msg}（请检查网络）")
 
     def _fill_table(self, results):
         self.table.setRowCount(len(results))
@@ -281,6 +305,8 @@ class ModelSearchDialog(QDialog):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(2000)
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.wait(2000)   # 搜索无取消语义，等待本次请求结束
         event.accept()
 
 

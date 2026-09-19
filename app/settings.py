@@ -68,3 +68,14 @@ def set_export_dir(path: str):
     else:
         _qsettings().remove("paths/export_dir")
     _qsettings().sync()
+
+
+def get_ui(name: str, default: str = "") -> str:
+    """读取界面偏好（引擎/语言/精细度等），统一以字符串存取。"""
+    return str(_qsettings().value(f"ui/{name}", default) or default)
+
+
+def set_ui(name: str, value):
+    """保存界面偏好；None 存为空串。"""
+    _qsettings().setValue(f"ui/{name}", "" if value is None else str(value))
+    _qsettings().sync()

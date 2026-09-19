@@ -91,14 +91,34 @@ def _probe_duration(path: str) -> float:
 
 
 # ==================== 转写核心（与线程解耦） ====================
+def _pct_reporter(on_progress, duration: float):
+    """构造把「已处理到的时间点」换算为百分比并去重的回调。
+
+    duration 未知（<=0）时返回空操作，不产生进度回调。
+    """
+    if not on_progress or not duration or duration <= 0:
+        return lambda end: None
+    state = {"last": -1}
+
+    def _report(end):
+        pct = int(max(0.0, min(1.0, float(end) / duration)) * 100)
+        if pct != state["last"]:
+            state["last"] = pct
+            on_progress(pct)
+
+    return _report
+
+
 def transcribe_media(media_path: str, model_path: str, engine: str = "cpu",
                      language="auto", task: str = "transcribe",
                      beam_size: int = 5, use_vad: bool = True, batched: bool = False,
-                     on_segment=None, on_status=None, cancel_check=None):
+                     on_segment=None, on_status=None, on_progress=None,
+                     cancel_check=None):
     """执行一次转写，返回 (segments, info)。
 
     on_segment(start, end, text) —— 每识别出一段即回调（可为 None）。
     on_status(text)             —— 状态文案回调（可为 None）。
+    on_progress(pct)            —— 进度百分比 0~100（可为 None）。
     cancel_check() -> bool      —— 返回 True 时中止并抛出 CancelledError。
     engine: "cpu" / "cuda"（faster-whisper）/ "mlx"（mlx-whisper，仅 macOS）。
     language: None 或 "auto" 表示自动检测。
@@ -106,13 +126,14 @@ def transcribe_media(media_path: str, model_path: str, engine: str = "cpu",
     lang = None if language in (None, "auto", "") else language
     if engine == "mlx":
         return _transcribe_mlx(media_path, model_path, lang, task,
-                               on_segment, on_status, cancel_check)
+                               on_segment, on_status, on_progress, cancel_check)
     return _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
-                          use_vad, batched, on_segment, on_status, cancel_check)
+                          use_vad, batched, on_segment, on_status, on_progress,
+                          cancel_check)
 
 
 def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
-                   use_vad, batched, on_segment, on_status, cancel_check):
+                   use_vad, batched, on_segment, on_status, on_progress, cancel_check):
     """faster-whisper 路径（CPU / NVIDIA CUDA）。"""
     from .config import ENGINES
     try:
@@ -162,6 +183,8 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
             initial_prompt=_initial_prompt(lang),
         )
 
+    # 用 info.duration 与已处理段落的 end 估算进度（percent 去重后回调）
+    report = _pct_reporter(on_progress, float(getattr(info, "duration", 0) or 0))
     segs = []
     for seg in segments:
         if cancel_check and cancel_check():
@@ -170,6 +193,7 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
         segs.append({"start": seg.start, "end": seg.end, "text": text})
         if on_segment:
             on_segment(seg.start, seg.end, text)
+        report(seg.end)
 
     info_obj = {
         "duration": info.duration,
@@ -180,8 +204,13 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
     return segs, info_obj
 
 
-def _transcribe_mlx(media_path, model_path, lang, task, on_segment, on_status, cancel_check):
-    """mlx-whisper 路径（Apple Metal GPU）。"""
+def _transcribe_mlx(media_path, model_path, lang, task, on_segment, on_status,
+                    on_progress, cancel_check):
+    """mlx-whisper 路径（Apple Metal GPU）。
+
+    注意：mlx_whisper.transcribe 一次性返回全部结果，不提供流式进度，
+    故本路径不使用 on_progress（界面保持不确定进度动画）。
+    """
     try:
         import mlx_whisper
     except ImportError as e:
@@ -249,6 +278,7 @@ class TranscribeWorker(QThread):
     model_loading = Signal()
     segment_ready = Signal(float, float, str)   # start, end, text
     progress_text = Signal(str)
+    progress_pct = Signal(int)                  # 0~100
     finished_ok = Signal(list, object)          # segments(list[dict]), info
     failed = Signal(str)
 
@@ -280,6 +310,7 @@ class TranscribeWorker(QThread):
                 use_vad=self.use_vad, batched=self.batched,
                 on_segment=lambda s, e, t: self.segment_ready.emit(s, e, t),
                 on_status=lambda m: self.progress_text.emit(m),
+                on_progress=lambda p: self.progress_pct.emit(p),
                 cancel_check=lambda: self._cancelled,
             )
             if self._cancelled:

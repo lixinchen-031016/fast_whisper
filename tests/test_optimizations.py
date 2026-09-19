@@ -320,3 +320,139 @@ def test_segment_batching_flush(qapp, isolated_settings):
     assert w.seg_table.rowCount() == 95
     assert len(w.segments) == 95
     assert w.seg_table.item(94, 2).text() == "t94"
+
+
+# ==================== 第二轮：已下载判定 / 重试 / 导出清洗 ====================
+def test_model_info_is_downloaded_supports_mlx(isolated_settings, tmp_path):
+    """is_downloaded 必须同时识别 CTranslate2(model.bin) 与 MLX(safetensors)。"""
+    isolated_settings.set_models_dir(str(tmp_path))
+    fw = tmp_path / "Org__fw-model"; fw.mkdir(); (fw / "model.bin").write_bytes(b"x")
+    mlx = tmp_path / "Org__mlx-model"; mlx.mkdir()
+    (mlx / "model.safetensors").write_bytes(b"x")
+    empty = tmp_path / "Org__empty"; empty.mkdir()
+
+    assert model_manager.ModelInfo("Org/fw-model").is_downloaded is True
+    assert model_manager.ModelInfo("Org/mlx-model").is_downloaded is True
+    assert model_manager.ModelInfo("Org/empty").is_downloaded is False
+
+
+def test_get_retries_then_success(monkeypatch):
+    state = {"n": 0}
+
+    class _Ok:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout=None, **kw):
+        state["n"] += 1
+        if state["n"] < 3:
+            raise requests.ConnectionError("boom")
+        return _Ok()
+
+    monkeypatch.setattr(model_manager.requests, "get", fake_get)
+    monkeypatch.setattr(model_manager.time, "sleep", lambda s: None)
+    model_manager._get("http://example/x")
+    assert state["n"] == 3        # 前两次失败、第三次成功
+
+
+def test_get_exhausts_retries(monkeypatch):
+    def fake_get(url, timeout=None, **kw):
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr(model_manager.requests, "get", fake_get)
+    monkeypatch.setattr(model_manager.time, "sleep", lambda s: None)
+    with pytest.raises(requests.RequestException):
+        model_manager._get("http://example/x", retries=2)
+
+
+def test_exporter_drops_empty_segments(tmp_path):
+    from app import exporter
+    segs = [{"start": 0, "end": 1, "text": "你好"},
+            {"start": 1, "end": 2, "text": "   "},      # 空段应被丢弃
+            {"start": 2, "end": 3, "text": " 世界 "}]
+    p = str(tmp_path / "o.txt")
+    exporter.export_txt(segs, p)
+    assert open(p, encoding="utf-8").read() == "你好\n世界\n"
+
+    ps = str(tmp_path / "o.srt")
+    exporter.export_srt(segs, ps)
+    srt = open(ps, encoding="utf-8").read()
+    assert srt.startswith("1\n")
+    assert srt.count("-->") == 2        # 空段不产生字幕条目
+
+
+# ==================== 第二轮：界面偏好持久化 ====================
+def test_ui_pref_roundtrip(isolated_settings):
+    isolated_settings.set_ui("engine", "cuda")
+    assert isolated_settings.get_ui("engine") == "cuda"
+    isolated_settings.set_ui("vad", None)               # None → 空串
+    assert isolated_settings.get_ui("vad", "1") == "1"  # 回退默认
+
+
+def test_main_window_prefs_persist(qapp, isolated_settings):
+    from app.main_window import MainWindow
+    w = MainWindow()
+    w.lang_combo.setCurrentIndex(1)      # 中文
+    w.beam_combo.setCurrentIndex(0)      # beam=1
+    w.vad_check.setChecked(False)
+    w._save_prefs()
+
+    w2 = MainWindow()                    # 重新构造 → 应恢复上次选择
+    assert w2.lang_combo.currentData() == w.lang_combo.currentData()
+    assert w2.beam_combo.currentData() == 1
+    assert w2.vad_check.isChecked() is False
+
+
+def test_cancel_button_visibility_toggles(qapp, isolated_settings):
+    from app.main_window import MainWindow
+    w = MainWindow()
+    assert w.cancel_btn.isHidden() is True
+    w._set_busy(True)
+    assert w.cancel_btn.isHidden() is False
+    assert w.start_btn.isEnabled() is False
+    w._set_busy(False)
+    assert w.cancel_btn.isHidden() is True
+
+
+# ==================== 第二轮：转写进度回调 ====================
+def test_transcribe_reports_progress(monkeypatch):
+    import sys
+    import types
+
+    workers.clear_model_cache()
+    _FakeWhisperModel.instances = 0
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = _FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+
+    prog = []
+    workers.transcribe_media("/a.mp3", "/m", engine="cpu", language="zh",
+                             on_progress=prog.append)
+    # info.duration=12.5，段落 end=1.0/2.0 → 8% / 16%
+    assert prog == [8, 16]
+    workers.clear_model_cache()
+
+
+# ==================== 第二轮：搜索线程成功/失败 ====================
+def test_search_worker_success_and_failure(qapp, monkeypatch):
+    from PySide6.QtCore import Qt
+    from app import widgets
+
+    monkeypatch.setattr(model_manager, "search_models", lambda *a, **k: ["m1", "m2"])
+    ok = []
+    w = widgets.SearchWorker("q", "cpu")
+    w.finished_ok.connect(ok.append, Qt.ConnectionType.DirectConnection)
+    w.start(); w.wait(2000)
+    assert ok == [["m1", "m2"]]
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(model_manager, "search_models", _boom)
+    err = []
+    w2 = widgets.SearchWorker("q", "cpu")
+    w2.failed.connect(err.append, Qt.ConnectionType.DirectConnection)
+    w2.start(); w2.wait(2000)
+    assert err and "boom" in err[0]

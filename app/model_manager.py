@@ -10,6 +10,7 @@
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -19,6 +20,7 @@ from . import settings
 from .config import HF_MIRROR
 
 TIMEOUT = 15
+GET_RETRIES = 3          # 元信息/搜索请求失败重试次数（网络抖动自愈）
 
 # 并行下载并发数：模型仓库通常含多个文件（权重 + config/vocab 等小文件），
 # 适度并发可显著缩短总耗时；过高可能触发镜像站限流，默认 4。
@@ -42,14 +44,34 @@ class ModelInfo:
 
     @property
     def is_downloaded(self) -> bool:
-        """以 model.bin 是否存在作为“已下载完成”的判据。"""
-        return os.path.isfile(os.path.join(self.local_dir, "model.bin"))
+        """是否已下载完成：兼容两种引擎的模型格式。
+
+        - CTranslate2（faster-whisper / CUDA）：含 model.bin
+        - MLX（mlx-whisper）：含 *.safetensors 或 weights.npz
+        """
+        d = self.local_dir
+        if os.path.isfile(os.path.join(d, "model.bin")):
+            return True
+        if os.path.isdir(d):
+            for name in os.listdir(d):
+                if name.endswith(".safetensors") or name == "weights.npz":
+                    return True
+        return False
 
 
-def _get(url: str, **kwargs) -> requests.Response:
-    resp = requests.get(url, timeout=TIMEOUT, **kwargs)
-    resp.raise_for_status()
-    return resp
+def _get(url: str, retries: int = GET_RETRIES, **kwargs) -> requests.Response:
+    """带重试与指数退避的 GET（应对镜像站瞬时抖动）。"""
+    last_exc = None
+    for attempt in range(max(1, retries)):
+        try:
+            resp = requests.get(url, timeout=TIMEOUT, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < retries - 1:
+                time.sleep(0.6 * (2 ** attempt))   # 0.6s → 1.2s 退避
+    raise last_exc
 
 
 def filter_by_engine(repo_id: str, engine: str) -> bool:

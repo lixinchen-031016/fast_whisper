@@ -17,7 +17,7 @@ from .theme import TEXT_SECOND
 from .widgets import Card, DropArea, ModelSearchDialog, SettingsDialog
 from .workers import (
     BatchTranscribeWorker, TranscribeWorker, check_media_decode,
-    list_local_models, local_model_kind, scan_media_files,
+    clear_model_cache, list_local_models, local_model_kind, scan_media_files,
 )
 
 LANGS = [("自动检测", "auto"), ("中文", "zh"), ("英语", "en"), ("日语", "ja"),
@@ -47,6 +47,7 @@ class MainWindow(QMainWindow):
         self._flush_timer.timeout.connect(self._flush_rows)
 
         self._build_ui()
+        self._restore_prefs()
         self.refresh_models()
 
     # ================= UI 构建 =================
@@ -164,6 +165,13 @@ class MainWindow(QMainWindow):
             "逐个自动导出为 TXT 到导出目录；模型只加载一次")
         self.batch_btn.clicked.connect(self.start_batch_transcribe)
         action_row.addWidget(self.batch_btn)
+
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setObjectName("dangerButton")
+        self.cancel_btn.setToolTip("中止当前转写任务")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel_job)
+        action_row.addWidget(self.cancel_btn)
         card3.layout().addLayout(action_row)
 
         self.progress = QProgressBar()
@@ -311,6 +319,7 @@ class MainWindow(QMainWindow):
 
     def _on_settings_saved(self):
         from . import settings
+        clear_model_cache()   # 模型目录可能已变，释放旧目录的已加载模型
         self.refresh_models()
         self.status_label.setText(
             f"设置已保存：模型目录 {settings.get_models_dir()}"
@@ -323,6 +332,40 @@ class MainWindow(QMainWindow):
             bool(self.media_path) and bool(self.model_combo.currentData()) and not busy
         )
         self.batch_btn.setEnabled(bool(self.model_combo.currentData()) and not busy)
+
+    # ================= 偏好持久化 =================
+    def _restore_prefs(self):
+        """恢复上次使用的引擎 / 语言 / 输出模式 / 精细度 / 选项。"""
+        from . import settings
+
+        def _select(combo, key, cast=str):
+            raw = settings.get_ui(key, "")
+            if not raw:
+                return
+            try:
+                data = cast(raw)
+            except (TypeError, ValueError):
+                return
+            idx = combo.findData(data)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        _select(self.engine_combo, "engine")
+        _select(self.lang_combo, "language")
+        _select(self.task_combo, "task")
+        _select(self.beam_combo, "beam", int)
+        self.vad_check.setChecked(settings.get_ui("vad", "1") == "1")
+        self.batched_check.setChecked(settings.get_ui("batched", "0") == "1")
+
+    def _save_prefs(self):
+        """保存当前界面偏好，下次启动自动恢复。"""
+        from . import settings
+        settings.set_ui("engine", self.engine_combo.currentData())
+        settings.set_ui("language", self.lang_combo.currentData())
+        settings.set_ui("task", self.task_combo.currentData())
+        settings.set_ui("beam", str(self.beam_combo.currentData()))
+        settings.set_ui("vad", "1" if self.vad_check.isChecked() else "0")
+        settings.set_ui("batched", "1" if self.batched_check.isChecked() else "0")
 
     # ================= 转写 =================
     def _preflight(self):
@@ -384,8 +427,13 @@ class MainWindow(QMainWindow):
 
         self._clear_results()
         self._batch_total = 0
-        self.start_btn.setEnabled(False)
-        self.batch_btn.setEnabled(False)
+        self._set_busy(True)
+        # mlx 一次性返回、无流式进度 → 保持不确定动画；其余显示真实百分比
+        if self._engine_kind(engine) == "mlx":
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
         self.progress.setVisible(True)
         self.status_label.setText("准备中…")
 
@@ -401,6 +449,7 @@ class MainWindow(QMainWindow):
                      and self.batched_check.isChecked()),
         )
         self.worker.progress_text.connect(self.status_label.setText)
+        self.worker.progress_pct.connect(self.progress.setValue)
         self.worker.segment_ready.connect(self._on_segment)
         self.worker.finished_ok.connect(self._on_transcribe_ok)
         self.worker.failed.connect(self._on_transcribe_fail)
@@ -429,8 +478,7 @@ class MainWindow(QMainWindow):
 
         self._clear_results()
         self._batch_total = len(files)
-        self.start_btn.setEnabled(False)
-        self.batch_btn.setEnabled(False)
+        self._set_busy(True)
         self.progress.setRange(0, len(files))
         self.progress.setValue(0)
         self.progress.setVisible(True)
@@ -472,7 +520,7 @@ class MainWindow(QMainWindow):
         self._batch_total = 0
         self.progress.setVisible(False)
         self.progress.setRange(0, 0)   # 恢复单文件模式的流水动画
-        self._update_start_state()
+        self._set_busy(False)
         # 表格中保留最后一个文件的分段，允许手动再导出
         self._set_export_enabled(bool(self.segments))
         self.status_label.setText(f"批量转写完成：成功 {done} / {total} 个文件")
@@ -526,7 +574,7 @@ class MainWindow(QMainWindow):
         self._flush_rows()
         self.info = info or {}
         self.progress.setVisible(False)
-        self._update_start_state()
+        self._set_busy(False)
         dur = self.info.get("duration", 0)
         lang = self.info.get("language", "?")
         self.status_label.setText(
@@ -537,9 +585,26 @@ class MainWindow(QMainWindow):
     def _on_transcribe_fail(self, msg):
         self._flush_rows()
         self.progress.setVisible(False)
-        self._update_start_state()
+        self._set_busy(False)
         self.status_label.setText(f"转写失败：{msg}")
         QMessageBox.critical(self, "转写失败", msg)
+
+    def _set_busy(self, busy: bool):
+        """统一切换忙碌态：忙碌时禁用启动按钮并显示取消按钮。"""
+        self.cancel_btn.setVisible(busy)
+        self.cancel_btn.setEnabled(busy)
+        if busy:
+            self.start_btn.setEnabled(False)
+            self.batch_btn.setEnabled(False)
+        else:
+            self._update_start_state()
+
+    def _cancel_job(self):
+        for w in (self.worker, self.batch_worker):
+            if w and w.isRunning():
+                w.cancel()
+        self.cancel_btn.setEnabled(False)
+        self.status_label.setText("正在取消…")
 
     def _set_export_enabled(self, on: bool):
         for name in ("export_txt", "export_srt", "export_md", "export_docx"):
@@ -555,31 +620,44 @@ class MainWindow(QMainWindow):
         default_dir = settings.get_export_dir() or (os.path.dirname(self.media_path) or ".")
         default = os.path.join(default_dir, f"{base}_转写稿.{ext}")
         path, _ = QFileDialog.getSaveFileName(self, "导出", default, filter_text)
+        # 用户未填扩展名时按当前格式自动补全
+        if path and not os.path.splitext(path)[1]:
+            path = f"{path}.{ext}"
         return path
+
+    def _run_export(self, fn):
+        """执行导出并统一处理异常（磁盘满 / 权限 / 缺依赖），避免崩溃。"""
+        try:
+            path = fn()
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "导出失败",
+                f"缺少依赖库：{e}\n（导出 Word 文档需要 python-docx）")
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"{type(e).__name__}: {e}")
+            return
+        self._export_done(path)
 
     def export_txt(self):
         path = self._save_path("txt", "文本文件 (*.txt)")
         if path:
-            export_txt(self.segments, path)
-            self._export_done(path)
+            self._run_export(lambda: export_txt(self.segments, path))
 
     def export_srt(self):
         path = self._save_path("srt", "SRT 字幕 (*.srt)")
         if path:
-            export_srt(self.segments, path)
-            self._export_done(path)
+            self._run_export(lambda: export_srt(self.segments, path))
 
     def export_md(self):
         path = self._save_path("md", "Markdown (*.md)")
         if path:
-            export_markdown(self.segments, path, self._title())
-            self._export_done(path)
+            self._run_export(lambda: export_markdown(self.segments, path, self._title()))
 
     def export_docx(self):
         path = self._save_path("docx", "Word 文档 (*.docx)")
         if path:
-            export_docx(self.segments, path, self._title())
-            self._export_done(path)
+            self._run_export(lambda: export_docx(self.segments, path, self._title()))
 
     def _title(self) -> str:
         base = os.path.splitext(os.path.basename(self.media_path))[0] if self.media_path else "语音转写稿"
@@ -595,4 +673,5 @@ class MainWindow(QMainWindow):
             if w and w.isRunning():
                 w.cancel()
                 w.wait(1500)
+        self._save_prefs()
         event.accept()

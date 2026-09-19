@@ -25,9 +25,23 @@ def _fmt_ts_md(seconds: float) -> str:
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
+def _clean(segments: list) -> list:
+    """归一化分段：去除文字首尾空白并丢弃空段（避免空行/空字幕）。"""
+    out = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if text:
+            out.append({
+                "start": seg.get("start", 0.0),
+                "end": seg.get("end", 0.0),
+                "text": text,
+            })
+    return out
+
+
 def export_txt(segments: list, path: str, with_timestamps: bool = False) -> str:
     with open(path, "w", encoding="utf-8") as f:
-        for seg in segments:
+        for seg in _clean(segments):
             if with_timestamps:
                 f.write(f"[{_fmt_ts_md(seg['start'])} -> {_fmt_ts_md(seg['end'])}] ")
             f.write(seg["text"] + "\n")
@@ -36,7 +50,7 @@ def export_txt(segments: list, path: str, with_timestamps: bool = False) -> str:
 
 def export_srt(segments: list, path: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments, 1):
+        for i, seg in enumerate(_clean(segments), 1):
             f.write(f"{i}\n{_fmt_ts_srt(seg['start'])} --> {_fmt_ts_srt(seg['end'])}\n"
                     f"{seg['text']}\n\n")
     return path
@@ -45,7 +59,7 @@ def export_srt(segments: list, path: str) -> str:
 def export_markdown(segments: list, path: str, title: str = "语音转写稿") -> str:
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# {title}\n\n")
-        for seg in segments:
+        for seg in _clean(segments):
             f.write(f"- **[{_fmt_ts_md(seg['start'])}]** {seg['text']}\n")
     return path
 
@@ -73,7 +87,7 @@ def export_docx(segments: list, path: str, title: str = "语音转写稿") -> st
     r = p.add_run(title); r.bold = True
     r.font.size = Pt(18); r.font.color.rgb = ACCENT; set_cn_font(r)
 
-    for seg in segments:
+    for seg in _clean(segments):
         p = doc.add_paragraph()
         ts = p.add_run(f"[{_fmt_ts_md(seg['start'])}] ")
         ts.font.size = Pt(8); ts.font.color.rgb = GRAY; ts.font.name = "Menlo"
