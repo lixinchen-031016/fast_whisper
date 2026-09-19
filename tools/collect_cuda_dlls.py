@@ -26,16 +26,23 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     try:
-        import nvidia
+        import importlib.util
+        spec = importlib.util.find_spec("nvidia")
+        if spec is None or not spec.submodule_search_locations:
+            raise ImportError
+        # nvidia 是命名空间包（无 __init__.py），__file__ 为 None，
+        # 必须经 find_spec 取 submodule_search_locations
+        search_bases = list(spec.submodule_search_locations)
     except ImportError:
         print("未安装 nvidia-* 运行库（nvidia-cublas-cu12 / nvidia-cudnn-cu12），跳过收集")
         return
 
-    base = os.path.dirname(nvidia.__file__)
-    patterns = [
-        os.path.join(base, "*", "bin", "*.dll"),    # Windows
-        os.path.join(base, "*", "bin", "*.so*"),    # Linux（预留）
-    ]
+    patterns = []
+    for base in search_bases:
+        patterns += [
+            os.path.join(base, "*", "bin", "*.dll"),    # Windows
+            os.path.join(base, "*", "bin", "*.so*"),    # Linux（预留）
+        ]
     copied = 0
     for pattern in patterns:
         for src in glob.glob(pattern):
@@ -44,6 +51,9 @@ def main():
             shutil.copy2(src, dest)
             copied += 1
     print(f"已收集 {copied} 个 CUDA 运行库文件到 {out_dir}")
+    if copied == 0:
+        print("警告：nvidia 包存在但未找到任何 DLL/SO，请检查安装完整性")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
