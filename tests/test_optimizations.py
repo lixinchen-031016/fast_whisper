@@ -21,7 +21,9 @@ class _FakeResp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(f"HTTP {self.status_code}")
+            # 与真实 requests 一致：HTTPError.response 指向响应本身，
+            # 下载重试逻辑据此区分 4xx（不重试）与 5xx/429（重试）
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def iter_content(self, chunk_size=1):
         for i in range(0, len(self._body), chunk_size):
@@ -52,7 +54,8 @@ class _FakeSession:
             start = int(rng.split("=")[1].split("-")[0])
             if start >= total:
                 self.record.append(("416", url))
-                return _FakeResp(416, {"content-range": f"bytes */{total}"})
+                # 416 也按 lie 声明大小，便于模拟“服务器始终谎报长度”的场景
+                return _FakeResp(416, {"content-range": f"bytes */{declared}"})
             body = data[start:]
             self.record.append(("206", url))
             return _FakeResp(206, {
@@ -167,6 +170,7 @@ def test_download_ignore_range_no_overcount(isolated_settings, tmp_path, monkeyp
 
 # ==================== 下载：长度不符 → 报错 ====================
 def test_download_size_mismatch_raises(isolated_settings, tmp_path, monkeypatch):
+    """服务器始终谎报长度（200 与 416 都报 5000，实际只有 100）→ 重试后仍报错。"""
     repo = "repo/model"
     files = ["m.bin"]
     url = _url(repo, "m.bin")
@@ -175,6 +179,7 @@ def test_download_size_mismatch_raises(isolated_settings, tmp_path, monkeypatch)
     # 声明 5000 字节，实际只返回 100，触发完成后校验失败
     factory, _rec = _factory({url: b"z" * 100}, lie={url: 5000})
     monkeypatch.setattr(model_manager.requests, "Session", factory)
+    monkeypatch.setattr(model_manager.time, "sleep", lambda s: None)   # 跳过退避等待
 
     with pytest.raises(IOError):
         model_manager.download_model(repo)
@@ -572,3 +577,394 @@ def test_friendly_error_ffmpeg_missing():
 def test_friendly_error_no_audio_stream():
     msg = workers._friendly_media_error(ValueError("媒体文件中没有可用的音频流"))
     assert "音频轨道" in msg
+
+
+# ==================== 第四轮：线程保活 / 下载重试 / 批量进度 ====================
+def test_retain_worker_keeps_running_thread_alive(qapp, monkeypatch):
+    """QThread 运行期间必须被保活，否则对象被回收时 Qt 会 qFatal 崩溃。
+
+    回归场景：搜索框里发起搜索后立刻关闭对话框——原先 SearchWorker 只被对话框
+    属性引用，对话框销毁即丢掉最后一个引用，而线程可能还在跑（镜像站慢时有 15s
+    超时 + 重试）。保活后线程对象在结束前一直有强引用。
+    """
+    import threading as _threading
+
+    from app import widgets
+
+    class _BlockingWorker(workers.RetainedThread):
+        def __init__(self):
+            super().__init__()
+            self.gate = _threading.Event()
+
+        def run(self):
+            self.gate.wait(5)          # 停在 run() 里，状态可确定地断言
+
+    w = _BlockingWorker()
+    w.start()
+    assert w in workers._LIVE_WORKERS              # 启动即登记，运行期间不会被回收
+    w.gate.set()
+    w.wait(3000)
+    qapp.processEvents()                           # 释放回调经事件队列派发
+    assert w not in workers._LIVE_WORKERS          # 结束后自动解除，不会长期滞留
+
+    monkeypatch.setattr(model_manager, "search_models", lambda *a, **k: [])
+    s = widgets.SearchWorker("q", "cpu")
+    s.start()
+    s.wait(3000)
+    qapp.processEvents()
+    assert s not in workers._LIVE_WORKERS
+
+    # RetainedThread 判定：所有工作线程都继承保活基类
+    for cls in (workers.DownloadWorker, workers.TranscribeWorker,
+                workers.BatchTranscribeWorker, widgets.SearchWorker):
+        assert issubclass(cls, workers.RetainedThread), cls
+
+
+def test_on_file_chosen_keeps_start_disabled_while_busy(qapp, isolated_settings, tmp_path):
+    """转写进行中拖入新文件不得重新启用「开始转写」（否则会并发启动第二个任务）。
+
+    回归：原实现直接 start_btn.setEnabled(bool(currentData()))，绕过了忙碌判定。
+    """
+    from app.main_window import MainWindow
+
+    media = tmp_path / "a.mp3"
+    media.write_bytes(b"x")
+
+    class _Running:
+        def isRunning(self):
+            return True
+
+    w = MainWindow()
+    w.worker = _Running()          # 模拟正在转写的线程
+    w._on_file_chosen(str(media))
+    assert w.start_btn.isEnabled() is False
+    assert w.batch_btn.isEnabled() is False
+
+    w.worker = None                # 任务结束 → 恢复可用
+    w._on_file_chosen(str(media))
+    assert w.start_btn.isEnabled() is (bool(w.model_combo.currentData()))
+
+
+def test_resolve_model_path(isolated_settings, tmp_path):
+    """内置仓库 id 映射到模型目录；已是目录则原样返回（预检与扫描共用）。"""
+    isolated_settings.set_models_dir(str(tmp_path))
+    p = workers.resolve_model_path("Systran/faster-whisper-tiny", "cpu")
+    assert p == os.path.join(str(tmp_path), "Systran__faster-whisper-tiny")
+
+    real = tmp_path / "MyModel"
+    real.mkdir()
+    assert workers.resolve_model_path(str(real), "cpu") == str(real)
+    # 未知取值原样返回，不做猜测
+    assert workers.resolve_model_path("/tmp/nope", "cpu") == "/tmp/nope"
+
+
+def test_preflight_accepts_manually_placed_builtin_model(qapp, isolated_settings, tmp_path):
+    """内置推荐模型只要本地目录已有完整权重，就应该可直接转写（不再要求重新下载）。"""
+    from app.main_window import MainWindow
+
+    isolated_settings.set_models_dir(str(tmp_path))
+    d = tmp_path / "Systran__faster-whisper-tiny"
+    d.mkdir()
+    (d / "model.bin").write_bytes(b"x")
+
+    w = MainWindow()
+    # 显式固定 CPU 引擎：默认“自动识别”在 Apple Silicon 上会选中 Metal，
+    # 而本用例要验证的是 CTranslate2 内置模型（必须与引擎 kind 一致）
+    w.engine_combo.setCurrentIndex(w.engine_combo.findData("cpu"))
+    assert w._current_engine() == "cpu"
+    # 模拟“下载刚完成、列表还没刷新”的瞬间：下拉项仍是内置仓库 id，
+    # 但本地目录里已经有完整权重 → 预检应解析为本地目录并放行
+    w.model_combo.addItem("○ Systran/faster-whisper-tiny（未下载）",
+                          "Systran/faster-whisper-tiny")
+    w.model_combo.setCurrentIndex(w.model_combo.count() - 1)
+
+    pf = w._preflight()
+    assert pf is not None, "内置模型已有本地权重时应通过预检"
+    model_path, engine = pf
+    assert model_path == str(d) and engine == "cpu"
+
+
+def test_preflight_reports_missing_builtin_model(qapp, isolated_settings, tmp_path, monkeypatch):
+    """未下载的内置模型仍然要给出「需要先下载模型」的提示（返回 None）。"""
+    from app.main_window import MainWindow
+
+    isolated_settings.set_models_dir(str(tmp_path))
+    w = MainWindow()
+    w.engine_combo.setCurrentIndex(w.engine_combo.findData("cpu"))
+    idx = w.model_combo.findData("Systran/faster-whisper-tiny")
+    assert idx >= 0, "CPU 引擎下应列出 CTranslate2 内置推荐模型"
+    w.model_combo.setCurrentIndex(idx)
+
+    shown = []
+    monkeypatch.setattr("app.main_window.QMessageBox.information",
+                        lambda *a, **k: shown.append(a))
+    assert w._preflight() is None
+    assert shown
+
+
+def test_download_retries_after_dropped_stream(isolated_settings, tmp_path, monkeypatch):
+    """第一次下载流到一半断连 → 自动重试并续传，最终文件完整。"""
+    repo = "repo/model"
+    full = b"abcdefghij" * 500
+    url = _url(repo, "model.bin")
+    isolated_settings.set_models_dir(str(tmp_path))
+    monkeypatch.setattr(model_manager, "get_model_files", lambda r: ["model.bin"])
+    monkeypatch.setattr(model_manager.time, "sleep", lambda s: None)
+
+    record = []
+    state = {"dropped": False}
+
+    class _DroppingResp(_FakeResp):
+        def iter_content(self, chunk_size=1):
+            half = len(self._body) // 2
+            yield self._body[:half]                 # 只写一半就断
+            raise requests.ConnectionError("connection reset by peer")
+
+    class _FlakySession(_FakeSession):
+        def get(self, url, headers=None, **kw):
+            # 注意：每次重试都会新建 Session，抖动状态必须放在 Session 之外
+            if not state["dropped"]:
+                state["dropped"] = True
+                record.append(("drop", url))
+                body = self.contents.get(url, b"")
+                return _DroppingResp(200, {"content-length": str(len(body))}, body)
+            return super().get(url, headers=headers, **kw)
+
+    monkeypatch.setattr(model_manager.requests, "Session",
+                        lambda: _FlakySession({url: full}, record=record))
+
+    dest = model_manager.download_model(repo)
+    assert open(os.path.join(dest, "model.bin"), "rb").read() == full
+    assert ("drop", url) in record and ("206", url) in record   # 断连后走了续传
+
+
+def test_download_does_not_retry_client_error(isolated_settings, tmp_path, monkeypatch):
+    """404 之类的客户端错误不重试（避免把确定性失败放大成 3 倍等待）。"""
+    repo = "repo/model"
+    url = _url(repo, "model.bin")
+    isolated_settings.set_models_dir(str(tmp_path))
+    monkeypatch.setattr(model_manager, "get_model_files", lambda r: ["model.bin"])
+    monkeypatch.setattr(model_manager.time, "sleep", lambda s: None)
+
+    calls = []
+
+    class _Session404(_FakeSession):
+        def get(self, url, headers=None, **kw):
+            calls.append(url)
+            return _FakeResp(404, {})
+
+    monkeypatch.setattr(model_manager.requests, "Session", lambda: _Session404({url: b""}))
+    with pytest.raises(requests.HTTPError):
+        model_manager.download_model(repo)
+    assert len(calls) == 1
+
+
+def test_is_retryable_matrix():
+    assert model_manager._is_retryable(requests.ConnectionError("x")) is True
+    assert model_manager._is_retryable(IOError("size mismatch")) is True
+    assert model_manager._is_retryable(requests.HTTPError(response=_FakeResp(503, {}))) is True
+    assert model_manager._is_retryable(requests.HTTPError(response=_FakeResp(429, {}))) is True
+    assert model_manager._is_retryable(requests.HTTPError(response=_FakeResp(404, {}))) is False
+    assert model_manager._is_retryable(ValueError("nope")) is False
+
+
+def test_batch_worker_reports_whole_batch_progress(qapp, monkeypatch, tmp_path):
+    """批量进度应为整批百分比（含当前文件内部进度），单调不减直到 100。"""
+    from PySide6.QtCore import Qt
+
+    def _fake_transcribe(media, model, engine="cpu", language="auto", task="transcribe",
+                         beam_size=5, use_vad=True, batched=False, on_segment=None,
+                         on_status=None, on_progress=None, cancel_check=None):
+        for pct in (25, 50, 100):
+            if on_progress:
+                on_progress(pct)
+        if on_segment:
+            on_segment(0.0, 1.0, "文字")
+        return ([{"start": 0.0, "end": 1.0, "text": "文字"}], {"duration": 1.0})
+
+    monkeypatch.setattr(workers, "transcribe_media", _fake_transcribe)
+
+    files = [str(tmp_path / f"f{i}.mp3") for i in range(2)]
+    w = workers.BatchTranscribeWorker(files, "model", str(tmp_path / "out"))
+    seen = []
+    w.progress_pct.connect(seen.append, Qt.ConnectionType.DirectConnection)
+    done = []
+    w.finished_ok.connect(lambda a, b: done.append((a, b)), Qt.ConnectionType.DirectConnection)
+    w.start()
+    w.wait(5000)
+
+    assert seen and seen == sorted(seen)        # 单调不减
+    assert seen[-1] == 100                      # 结束时报满
+    assert done == [(2, 2)]
+    # 第 1 个文件 50% → 整批 25%；两个文件各占 50%
+    assert 25 in seen
+
+
+def test_cuda_failure_is_remembered(monkeypatch):
+    """CUDA 加载失败后应记住不可用，批量转写不再逐文件重试 CUDA 初始化。"""
+    from app import hardware
+
+    hardware._cache.pop("cuda", None)
+    try:
+        class _CT2:
+            @staticmethod
+            def get_cuda_device_count():
+                return 1                 # 探测说有显卡
+
+        monkeypatch.setitem(__import__("sys").modules, "ctranslate2", _CT2)
+        assert hardware.cuda_available() is True
+        hardware.mark_cuda_unusable()
+        assert hardware.cuda_available() is False    # 失败已被记住
+        assert hardware.detect_best() in ("cpu", "mlx")
+    finally:
+        hardware._cache.pop("cuda", None)
+
+
+def test_fw_cuda_load_failure_falls_back_and_memoizes(monkeypatch):
+    """CUDA 模型加载失败 → 回退 CPU，并把 CUDA 记为不可用。"""
+    import sys
+    import types
+
+    from app import hardware
+
+    hardware._cache.pop("cuda", None)
+    workers.clear_model_cache()
+    attempts = []
+
+    class _Model:
+        def __init__(self, path, device=None, compute_type=None, **kw):
+            attempts.append(device)
+            if device == "cuda":
+                raise RuntimeError("cublas64_12.dll not found")
+
+        def transcribe(self, media, **kw):
+            return ([_FakeSeg(0.0, 1.0, " 你好 ")], _FakeInfo())
+
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = _Model
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+
+    status = []
+    segs, info = workers.transcribe_media("/a.mp3", "/model", engine="cuda",
+                                          language="zh", on_status=status.append)
+    assert attempts == ["cuda", "cpu"]          # 先试 CUDA，失败回退 CPU
+    assert info["engine"] == "cuda"             # 展示上仍是用户所选引擎
+    assert [s["text"] for s in segs] == ["你好"]
+    assert any("回退 CPU" in m for m in status)
+    assert hardware._cache.get("cuda") is False  # 已记住，后续不再重试 CUDA
+    workers.clear_model_cache()
+    hardware._cache.pop("cuda", None)
+
+
+def test_batched_mode_passes_prompt_and_keeps_vad(monkeypatch):
+    """批量推理必须同样带上语种提示词，并强制 VAD 切块（否则长音频直接报错）。"""
+    import sys
+    import types
+
+    workers.clear_model_cache()
+    captured = {}
+
+    class _Model:
+        def __init__(self, path, device=None, compute_type=None, **kw):
+            pass
+
+    class _Batched:
+        def __init__(self, model=None):
+            pass
+
+        def transcribe(self, media, **kw):
+            captured.update(kw)
+            return ([_FakeSeg(0.0, 1.0, " hi ")], _FakeInfo())
+
+    pkg = types.ModuleType("faster_whisper")
+    pkg.WhisperModel = _Model
+    tp = types.ModuleType("faster_whisper.transcribe")
+    tp.BatchedInferencePipeline = _Batched
+    monkeypatch.setitem(sys.modules, "faster_whisper", pkg)
+    monkeypatch.setitem(sys.modules, "faster_whisper.transcribe", tp)
+
+    workers.transcribe_media("/a.mp3", "/model", engine="cpu", language="en", batched=True)
+    assert captured["vad_filter"] is True                     # 切块必需
+    assert captured["vad_parameters"] == {"min_silence_duration_ms": 500}
+    assert "English" in captured["initial_prompt"]            # 与逐段模式一致
+    workers.clear_model_cache()
+
+
+def test_status_label_updates_are_batched(qapp, isolated_settings):
+    """段数文案随表格一起按批刷新，不再每段改一次 QLabel。"""
+    from app.main_window import MainWindow
+
+    w = MainWindow()
+    w.status_label.setText("就绪")
+    for i in range(5):
+        w._on_segment(float(i), float(i) + 1, f"t{i}")
+    assert w.status_label.text() == "就绪"          # 未达阈值 → 不刷
+    w._flush_rows()
+    assert "已完成 5 段" in w.status_label.text()
+
+
+def test_dialog_download_progress_is_aggregated(qapp, isolated_settings):
+    """多文件并行下载时，进度条按字节总和计算（单调、不回退），并显示总体量。"""
+    from app.widgets import ModelSearchDialog
+
+    dlg = ModelSearchDialog(engine="fw")
+    dlg._file_progress = {}
+    dlg._on_progress("a.bin", 50, 100)       # 单文件 → 50%
+    assert dlg.progress.value() == 50
+    assert "总体" not in dlg.status_label.text()
+
+    dlg._on_progress("b.bin", 0, 100)        # 另一个大文件开始 → 总体回落到 25%
+    assert dlg.progress.value() == 25
+    dlg._on_progress("a.bin", 100, 100)
+    dlg._on_progress("b.bin", 100, 100)      # 全部完成 → 100%
+    assert dlg.progress.value() == 100
+    assert "总体" in dlg.status_label.text()
+
+
+# ==================== 第四轮：真实转写端到端（需要本地 tiny 模型） ====================
+_TINY_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "models", "Systran__faster-whisper-tiny")
+
+
+@pytest.mark.skipif(not os.path.isdir(_TINY_MODEL), reason="本地未下载 tiny 模型")
+def test_main_window_real_transcribe_end_to_end(qapp, isolated_settings, tmp_path):
+    """真实跑通「界面 → 工作线程 → 分段落表 → 状态收尾」全链路（无 mock）。
+
+    用仓库自带的 tiny 模型转写一段静音 WAV：不校验识别内容（静音无语音），
+    只验证管线能正常结束、忙碌态能复位、取消按钮会收起——这几处正是并发/崩溃类
+    缺陷的高发区（例如转写中拖入新文件会重新启用「开始转写」）。
+    """
+    from PySide6.QtCore import QTimer
+
+    from app.main_window import MainWindow
+
+    isolated_settings.set_models_dir(os.path.dirname(_TINY_MODEL))
+    wav = _write_wav(tmp_path / "silence.wav", seconds=2.0)
+
+    w = MainWindow()
+    w.engine_combo.setCurrentIndex(w.engine_combo.findData("cpu"))   # 固定 CPU 引擎
+    w.refresh_models()
+    idx = w.model_combo.findData(_TINY_MODEL)
+    assert idx >= 0, "本地 tiny 模型应出现在下拉列表中"
+    w.model_combo.setCurrentIndex(idx)
+
+    w._on_file_chosen(wav)
+    assert w.start_btn.isEnabled() is True
+
+    w.start_transcribe()
+    assert w.start_btn.isEnabled() is False          # 启动后进入忙碌态
+    assert w.cancel_btn.isHidden() is False
+
+    deadline = QTimer()
+    deadline.setSingleShot(True)
+    deadline.timeout.connect(qapp.quit)
+    deadline.start(120000)
+    w.worker.finished.connect(qapp.quit)
+    qapp.exec()
+
+    assert w.worker.isFinished()
+    assert w.progress.isVisible() is False           # 收尾隐藏进度条
+    assert w.cancel_btn.isHidden() is True           # 收尾收起取消按钮
+    assert "转写完成" in w.status_label.text() or "失败" in w.status_label.text()
+    assert w._pending_rows == []                          # 分段缓冲已排空
+    assert w.seg_table.rowCount() == len(w.segments)      # 表格与数据一致

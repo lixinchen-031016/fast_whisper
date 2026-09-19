@@ -3,7 +3,7 @@
 """可复用界面组件：圆角卡片、拖放导入区、模型搜索对话框。"""
 import os
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QDialog,
@@ -12,9 +12,10 @@ from PySide6.QtWidgets import (
 
 from . import model_manager
 from .theme import ACCENT, BORDER, TEXT, TEXT_SECOND
+from .workers import RetainedThread
 
 
-class SearchWorker(QThread):
+class SearchWorker(RetainedThread):
     """模型搜索线程：网络请求放后台，避免镜像站响应慢时界面冻结。"""
     finished_ok = Signal(list)
     failed = Signal(str)
@@ -133,6 +134,7 @@ class ModelSearchDialog(QDialog):
         self.resize(720, 560)
         self._worker = None
         self._search_worker = None
+        self._file_progress = {}   # filename -> (done_bytes, total_bytes)，算总体进度
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 20, 20, 16)
@@ -261,6 +263,7 @@ class ModelSearchDialog(QDialog):
         repo_id = self._selected_repo()
         if not repo_id:
             return
+        self._file_progress = {}
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.download_btn.setEnabled(False)
@@ -276,9 +279,17 @@ class ModelSearchDialog(QDialog):
         self._worker.start()
 
     def _on_progress(self, filename, done, total):
-        if total > 0:
-            self.progress.setValue(int(done * 100 / total))
-        self.status_label.setText(f"下载中：{filename}  {done / 1048576:.1f} / {total / 1048576:.1f} MB")
+        # 多文件并行下载：单文件进度会在文件之间来回跳动，改为按所有已知文件的
+        # 字节总和计算总体进度（单调不回退）；同时保留当前文件的明细。
+        self._file_progress[filename] = (done, total)
+        done_all = sum(d for d, _ in self._file_progress.values())
+        total_all = sum(t for _, t in self._file_progress.values())
+        if total_all > 0:
+            self.progress.setValue(min(100, int(done_all * 100 / total_all)))
+        self.status_label.setText(
+            f"下载中：{filename}  {done / 1048576:.1f} / {total / 1048576:.1f} MB"
+            + (f"　·　总体 {done_all / 1048576:.1f} / {total_all / 1048576:.1f} MB"
+               if len(self._file_progress) > 1 else ""))
 
     def _on_download_ok(self, local_dir):
         repo_id = self._worker.repo_id

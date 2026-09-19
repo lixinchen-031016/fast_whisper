@@ -25,3 +25,17 @@ def isolated_settings(tmp_path, monkeypatch):
     settings.set_settings_file(ini)
     yield settings
     settings.set_settings_file(None)  # 恢复默认后端
+
+
+@pytest.fixture(autouse=True)
+def _no_modal_dialogs(monkeypatch):
+    """离屏测试中一律不弹模态对话框。
+
+    `QMessageBox` 的静态方法内部会走 `QDialog::exec()`，在无头（offscreen）环境
+    没有用户可点击，会**永久阻塞**——把一次断言失败伪装成“测试卡死”，极难定位
+    （本仓库踩过：预检走到「模型架构不匹配 / 请先选择模型」分支后整轮挂起）。
+    需要验证弹窗内容与次数的测试可自行 monkeypatch 覆盖本夹具。
+    """
+    from PySide6.QtWidgets import QMessageBox
+    for name in ("information", "warning", "critical", "question", "about"):
+        monkeypatch.setattr(QMessageBox, name, staticmethod(lambda *a, **k: None))

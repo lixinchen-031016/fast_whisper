@@ -17,7 +17,8 @@ from .theme import TEXT_SECOND
 from .widgets import Card, DropArea, ModelSearchDialog, SettingsDialog
 from .workers import (
     BatchTranscribeWorker, TranscribeWorker, check_media_decode,
-    clear_model_cache, list_local_models, local_model_kind, scan_media_files,
+    clear_model_cache, list_local_models, local_model_kind, resolve_model_path,
+    scan_media_files,
 )
 
 LANGS = [("自动检测", "auto"), ("中文", "zh"), ("英语", "en"), ("日语", "ja"),
@@ -144,7 +145,8 @@ class MainWindow(QMainWindow):
         self.batched_check = QCheckBox("批量推理（更快，分段较粗）")
         self.batched_check.setToolTip(
             "VAD 切块后并行解码（CPU 实测约 1.8x）；分段粒度会变粗（按 30 秒窗口合并），"
-            "仅对 CPU / NVIDIA 引擎生效")
+            "仅对 CPU / NVIDIA 引擎生效；该模式必须开启 VAD 才能切块，故「过滤静音段」"
+            "在本模式下强制生效")
         grid.addWidget(self.batched_check, 3, 2, 1, 2)
 
         card2.layout().addLayout(grid)
@@ -244,7 +246,10 @@ class MainWindow(QMainWindow):
             return
         self.media_path = path
         self.drop_area.set_file(path)
-        self.start_btn.setEnabled(bool(self.model_combo.currentData()))
+        # 必须走统一状态更新：不能直接置 True，否则转写进行中拖入新文件会重新
+        # 启用「开始转写」，用户再点一次就会并发启动第二个任务并丢弃正在运行的
+        # 线程对象（Qt 在 QThread 运行时析构会直接崩溃）。
+        self._update_start_state()
         size_mb = os.path.getsize(path) / 1048576
         self.status_label.setText(f"已选择：{os.path.basename(path)}（{size_mb:.1f} MB）")
 
@@ -293,7 +298,7 @@ class MainWindow(QMainWindow):
             name = os.path.basename(path)
             self.model_combo.addItem(f"• {name}", path)
         for repo in ENGINES[engine]["builtin"]:
-            path = os.path.join(models_dir, repo.replace("/", "__"))
+            path = resolve_model_path(repo, engine)   # 与预检共用同一处路径推导
             if path not in local:
                 self.model_combo.addItem(f"○ {repo}（未下载）", repo)
         # 恢复选择
@@ -399,22 +404,28 @@ class MainWindow(QMainWindow):
                 "或改用 CPU / Metal 引擎。")
             return None
 
+        # 统一解析为本地目录：内置推荐项（形如 Systran/faster-whisper-tiny）映射到
+        # 模型目录下的 Systran__faster-whisper-tiny，避免把仓库 id 直接当路径传给
+        # 推理引擎（那会让 faster-whisper 去联网下载）。
+        want_kind = self._engine_kind(engine)
+        path = resolve_model_path(model_sel, engine)
+        kind = local_model_kind(path) if os.path.isdir(path) else None
+
         # 校验模型格式与引擎匹配（防止误用对方架构的模型）
-        if os.path.isdir(model_sel):
-            kind = local_model_kind(model_sel)
-            if kind and kind != self._engine_kind(engine):
-                QMessageBox.warning(
-                    self, "模型架构不匹配",
-                    f"所选模型是 {kind.upper()} 格式，与当前引擎（{engine}）不匹配。\n"
-                    "请切换引擎，或在「搜索 / 下载模型」中下载对应架构的模型。")
-                return None
-        elif model_sel in ENGINES[engine]["builtin"]:
+        if kind and kind != want_kind:
+            QMessageBox.warning(
+                self, "模型架构不匹配",
+                f"所选模型是 {kind.upper()} 格式，与当前引擎（{engine}）不匹配。\n"
+                "请切换引擎，或在「搜索 / 下载模型」中下载对应架构的模型。")
+            return None
+        if kind is None:
+            # 既不是本地模型目录，也不是内置推荐项（例如手动输入了非法值）
             QMessageBox.information(
                 self, "需要先下载模型",
                 "当前选中的模型尚未下载。\n请点击「搜索 / 下载模型…」，在列表中选中它并下载。")
             return None
 
-        return model_sel, engine
+        return path, engine
 
     def start_transcribe(self):
         if not self.media_path:
@@ -479,7 +490,7 @@ class MainWindow(QMainWindow):
         self._clear_results()
         self._batch_total = len(files)
         self._set_busy(True)
-        self.progress.setRange(0, len(files))
+        self.progress.setRange(0, 100)   # 整批百分比（含当前文件内部进度）
         self.progress.setValue(0)
         self.progress.setVisible(True)
         self.status_label.setText(f"批量转写 {len(files)} 个文件 → {out_dir}")
@@ -499,6 +510,7 @@ class MainWindow(QMainWindow):
         self.batch_worker.file_finished.connect(self._on_batch_file_finished)
         self.batch_worker.file_failed.connect(self._on_batch_file_failed)
         self.batch_worker.progress_text.connect(self.status_label.setText)
+        self.batch_worker.progress_pct.connect(self.progress.setValue)
         self.batch_worker.finished_ok.connect(self._on_batch_done)
         self.batch_worker.start()
 
@@ -508,11 +520,9 @@ class MainWindow(QMainWindow):
             f"[{idx}/{total}] 正在转写：{os.path.basename(path)}")
 
     def _on_batch_file_finished(self, idx, path, export_path):
-        self.progress.setValue(self.progress.value() + 1)
         self.status_label.setText(f"✓ 已导出：{os.path.basename(export_path)}")
 
     def _on_batch_file_failed(self, idx, path, err):
-        self.progress.setValue(self.progress.value() + 1)
         self.status_label.setText(f"✗ 失败：{os.path.basename(path)} — {err}")
 
     def _on_batch_done(self, done, total):
@@ -542,10 +552,8 @@ class MainWindow(QMainWindow):
             self._flush_rows()
         elif not self._flush_timer.isActive():
             self._flush_timer.start()
-        # 批量模式下由批量流程统一维护状态文案，避免来回覆盖
-        if not self._batch_total:
-            self.status_label.setText(
-                f"正在转写… 已完成 {self.seg_table.rowCount() + len(self._pending_rows)} 段")
+        # 段数文案随 _flush_rows 一起按批更新：逐段改 QLabel 文本会触发同样多次
+        # 布局/重绘，长音频（数千段）下这条路径的控件开销比插入表格还高。
 
     def _flush_rows(self):
         """把缓冲的分段一次性写入表格（关闭重绘 → 批量插入 → 恢复重绘）。"""
@@ -569,6 +577,9 @@ class MainWindow(QMainWindow):
         finally:
             table.setUpdatesEnabled(True)
         table.scrollToBottom()
+        # 批量模式下由批量流程统一维护状态文案，避免来回覆盖
+        if not self._batch_total:
+            self.status_label.setText(f"正在转写… 已完成 {table.rowCount()} 段")
 
     def _on_transcribe_ok(self, segments, info):
         self._flush_rows()

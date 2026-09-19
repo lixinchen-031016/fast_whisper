@@ -13,7 +13,7 @@ def cuda_available() -> bool:
     """NVIDIA GPU + CTranslate2 CUDA 支持是否可用。
 
     注意：即使有显卡，运行时还需系统安装 cuBLAS/cuDNN 才能真正加载模型，
-    加载失败时 TranscribeWorker 会自动回退 CPU。
+    加载失败时 TranscribeWorker 会自动回退 CPU（并调用 mark_cuda_unusable()）。
     """
     if "cuda" in _cache:
         return _cache["cuda"]
@@ -25,6 +25,17 @@ def cuda_available() -> bool:
         ok = False
     _cache["cuda"] = ok
     return ok
+
+
+def mark_cuda_unusable():
+    """把 CUDA 记为不可用（探测通过但真正加载模型失败时调用）。
+
+    `get_cuda_device_count()` 只反映“有没有显卡”，并不能说明 cuBLAS/cuDNN 是否齐全：
+    缺运行库时每次构造 CUDA 模型都会失败，并付出一次驱动探测 + CUDA 运行库
+    加载的代价（实测可达数秒）。批量转写时若每个文件都重试一遍 CUDA，
+    整批会白白浪费大量时间，故首次失败后直接记住，后续统一走 CPU。
+    """
+    _cache["cuda"] = False
 
 
 def metal_available() -> bool:

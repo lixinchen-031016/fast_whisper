@@ -22,6 +22,10 @@ from .config import HF_MIRROR
 TIMEOUT = 15
 GET_RETRIES = 3          # 元信息/搜索请求失败重试次数（网络抖动自愈）
 
+# 单个文件下载失败后的重试次数。大模型权重动辄数 GB，一次瞬时断连就整包失败
+# 对用户代价太高；续传机制使重试成本极低（只补缺失部分），故默认重试 3 次。
+FILE_RETRIES = 3
+
 # 并行下载并发数：模型仓库通常含多个文件（权重 + config/vocab 等小文件），
 # 适度并发可显著缩短总耗时；过高可能触发镜像站限流，默认 4。
 MAX_DOWNLOAD_WORKERS = 4
@@ -166,8 +170,34 @@ def _make_reporter(progress_cb):
 
 
 def _download_file(repo_id: str, filename: str, dest_dir: str,
-                   report, cancel_check) -> None:
-    """下载单个文件，支持断点续传与完成后大小校验。
+                   report, cancel_check, retries: int = FILE_RETRIES) -> None:
+    """下载单个文件；瞬时网络错误自动重试（续传），其余交给 _download_file_once。"""
+    for attempt in range(max(1, int(retries))):
+        try:
+            return _download_file_once(repo_id, filename, dest_dir, report, cancel_check)
+        except CancelledError:
+            raise
+        except Exception as e:
+            if attempt >= retries - 1 or not _is_retryable(e):
+                raise
+            time.sleep(0.6 * (2 ** attempt))   # 0.6s → 1.2s 退避
+
+
+def _is_retryable(e: Exception) -> bool:
+    """判断下载异常是否值得重试。
+
+    重试：连接类错误、5xx/429、磁盘/校验类 IOError（续传即可修复）。
+    不重试：4xx 客户端错误（如 404 仓库/文件不存在），重试只会浪费时间。
+    """
+    if isinstance(e, requests.HTTPError):
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code is None or code >= 500 or code == 429
+    return isinstance(e, (requests.RequestException, IOError))
+
+
+def _download_file_once(repo_id: str, filename: str, dest_dir: str,
+                        report, cancel_check) -> None:
+    """下载单个文件一次，支持断点续传与完成后大小校验。
 
     - 本地已有部分内容 → 带 Range 请求续传（服务器返回 206）
     - 服务器忽略 Range 返回 200 → 截断重下（避免进度超 100%）
@@ -194,7 +224,7 @@ def _download_file(repo_id: str, filename: str, dest_dir: str,
                     return
                 # 本地文件异常偏大 → 删除后全量重下一次
                 os.remove(dest_path)
-                return _download_file(repo_id, filename, dest_dir, report, cancel_check)
+                return _download_file_once(repo_id, filename, dest_dir, report, cancel_check)
 
             resp.raise_for_status()
             if resp.status_code == 206:
@@ -236,7 +266,7 @@ def download_model(repo_id: str, progress_cb=None, cancel_check=None,
 
     progress_cb(filename, downloaded_bytes, total_bytes)  用于进度上报（线程安全）。
     cancel_check() 返回 True 时中止下载并抛出 CancelledError。
-    多文件并行下载；每个文件支持断点续传（Range）与完成后大小校验。
+    多文件并行下载；每个文件支持断点续传（Range）、失败重试与完成后大小校验。
     """
     files = _required_files(repo_id)
     dest_dir = ModelInfo(repo_id).local_dir

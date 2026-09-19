@@ -12,8 +12,42 @@ import traceback
 
 from PySide6.QtCore import QThread, Signal
 
-from . import model_manager
+from . import model_manager, settings
 from .model_manager import CancelledError
+
+
+# ==================== 工作线程保活 ====================
+# Qt 在 QThread 仍运行时析构会直接 qFatal 崩溃（"QThread: Destroyed while thread
+# is still running"）。工作线程对象常常只被局部变量或对话框属性引用，一旦用户在
+# 任务进行中关闭窗口、关闭搜索框或再次触发任务，引用丢失就会触发该崩溃。
+# 这里统一保活：线程启动时登记强引用，结束后释放，与业务逻辑无关。
+_LIVE_WORKERS = set()
+_LIVE_WORKERS_LOCK = threading.Lock()
+
+
+def _release_worker(worker):
+    with _LIVE_WORKERS_LOCK:
+        _LIVE_WORKERS.discard(worker)
+
+
+def retain_worker(worker):
+    """登记正在运行的 QThread，避免其在运行期间被 GC/作用域回收而崩溃。
+
+    幂等：重复调用不会重复连接 finished 信号。线程结束后自动解除引用。
+    """
+    with _LIVE_WORKERS_LOCK:
+        if worker in _LIVE_WORKERS:
+            return
+        _LIVE_WORKERS.add(worker)
+    worker.finished.connect(lambda w=worker: _release_worker(w))
+
+
+class RetainedThread(QThread):
+    """启动即自动保活的 QThread 基类（见 retain_worker 的说明）。"""
+
+    def start(self, *args, **kwargs):
+        retain_worker(self)
+        super().start(*args, **kwargs)
 
 
 # ==================== 模型缓存 ====================
@@ -197,6 +231,9 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
     except Exception as e:
         # CUDA 环境不完整（缺 cuBLAS/cuDNN 等）时自动回退 CPU
         if device == "cuda":
+            # 记住这次失败：批量转写/连续转写时不再逐个文件重试 CUDA 初始化
+            from . import hardware
+            hardware.mark_cuda_unusable()
             _emit(f"NVIDIA GPU 加载失败（{e}），已自动回退 CPU 推理")
             model, _ = _load_cached(
                 model_path, "cpu", "int8",
@@ -208,11 +245,17 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
     if batched:
         # 批量推理：VAD 切块后并行解码（CPU 实测约 1.8x）。
         # 注意其参数集与逐段推理不同，不能混传 condition_on_previous_text 等。
+        # vad_filter 必须为真：批量管线依赖 VAD 把长音频切成 <=30s 的块，
+        # 关闭它时超过 30s 的音频会直接抛 RuntimeError（界面上已说明）。
         from faster_whisper.transcribe import BatchedInferencePipeline
         runner = BatchedInferencePipeline(model=model)
         segments, info = runner.transcribe(
             media_path, language=lang, task=task,
-            beam_size=beam_size, batch_size=8)
+            beam_size=beam_size, batch_size=8,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            initial_prompt=_initial_prompt(lang),   # 与逐段模式保持一致
+        )
     else:
         segments, info = model.transcribe(
             media_path, language=lang, task=task, beam_size=beam_size,
@@ -296,7 +339,7 @@ def _transcribe_mlx(media_path, model_path, lang, task, on_segment, on_status,
 
 
 # ==================== Qt 线程封装 ====================
-class DownloadWorker(QThread):
+class DownloadWorker(RetainedThread):
     """模型下载线程。"""
     # 注意用 float 而非 int：大模型（如 large-v3 约 3GB）字节数会超出
     # Qt 信号 C++ int（4 字节）的表示范围，触发 libshiboken Overflow
@@ -327,7 +370,7 @@ class DownloadWorker(QThread):
             self.failed.emit(f"{e}")
 
 
-class TranscribeWorker(QThread):
+class TranscribeWorker(RetainedThread):
     """单文件转写线程：加载模型 → 推理 → 逐段回报。"""
     model_loading = Signal()
     segment_ready = Signal(float, float, str)   # start, end, text
@@ -378,16 +421,19 @@ class TranscribeWorker(QThread):
             self.failed.emit(_friendly_media_error(e))
 
 
-class BatchTranscribeWorker(QThread):
+class BatchTranscribeWorker(RetainedThread):
     """批量转写线程：顺序处理多个媒体文件，逐个自动导出为 TXT。
 
     复用模型缓存：全部文件共用一次模型加载，避免逐文件重复加载。
+    progress_pct 报整批百分比（把“当前文件内百分比”折算进整批），
+    否则每个文件转写期间进度条都停在文件边界不动。
     """
     file_started = Signal(int, int, str)      # index(1-based), total, path
     segment_ready = Signal(float, float, str)
     file_finished = Signal(int, str, str)     # index, path, export_path
     file_failed = Signal(int, str, str)       # index, path, error
     progress_text = Signal(str)
+    progress_pct = Signal(int)                # 整批 0~100
     finished_ok = Signal(int, int)            # done, total
     failed = Signal(str)                      # 致命错误（如缺少依赖）
 
@@ -416,6 +462,12 @@ class BatchTranscribeWorker(QThread):
         for i, path in enumerate(self.media_files, 1):
             if self._cancelled:
                 break
+
+            def _on_pct(pct, index=i):
+                """把第 index 个文件内部的进度折算为整批百分比。"""
+                overall = ((index - 1) + max(0.0, min(100.0, float(pct))) / 100.0) / max(1, total)
+                self.progress_pct.emit(int(overall * 100))
+
             self.file_started.emit(i, total, path)
             try:
                 segs, _info = transcribe_media(
@@ -424,18 +476,22 @@ class BatchTranscribeWorker(QThread):
                     use_vad=self.use_vad, batched=self.batched,
                     on_segment=lambda s, e, t: self.segment_ready.emit(s, e, t),
                     on_status=lambda m: self.progress_text.emit(m),
+                    on_progress=_on_pct,
                     cancel_check=lambda: self._cancelled,
                 )
                 if self._cancelled:
                     break
                 out = self._export(path, segs)
                 done += 1
+                # 该文件必然已完成：即使引擎不报内部进度（Metal），进度条也会前进
+                self.progress_pct.emit(int(i * 100 / max(1, total)))
                 self.file_finished.emit(i, path, out)
             except CancelledError:
                 break
             except Exception as e:
                 traceback.print_exc()
                 self.file_failed.emit(i, path, _friendly_media_error(e))
+                self.progress_pct.emit(int(i * 100 / max(1, total)))
         self.finished_ok.emit(done, total)
 
     def _export(self, media_path: str, segs: list) -> str:
@@ -527,6 +583,25 @@ def local_model_kind(path: str):
         if name.endswith(".safetensors") or name == "weights.npz":
             return "mlx"
     return None
+
+
+def resolve_model_path(selector: str, engine: str) -> str:
+    """把界面上的“模型选择项”解析为本地目录路径。
+
+    选择项有两种形态：
+    - 已下载模型：字符串本身即本地目录路径，原样返回；
+    - 内置推荐模型（未下载）：形如 `Systran/faster-whisper-tiny` 的仓库 id，
+      映射到模型目录下的 `Systran__faster-whisper-tiny`。
+
+    主窗口的“模型列表刷新”与“转写前预检”共用这一处推导，避免两边各拼一次路径
+    而在模型目录变化后出现不一致（曾导致预检永远认为内置模型未下载）。
+    """
+    if os.path.isdir(selector):
+        return selector
+    from .config import ENGINES
+    if selector in ENGINES.get(engine, {}).get("builtin", []):
+        return os.path.join(settings.get_models_dir(), selector.replace("/", "__"))
+    return selector
 
 
 def list_local_models(models_dir: str, kind: str = None) -> list:
