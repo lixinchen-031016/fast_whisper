@@ -1427,3 +1427,337 @@ def test_mlx_import_error_distinguishes_missing_package_from_no_metal(monkeypatc
         workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="zh")
     assert "缺少 mlx-whisper" in str(ei2.value)
     assert "pip install mlx-whisper" in str(ei2.value)
+
+
+# ==================== 第七轮：批量导出覆盖 / 中断下载 / 导出命名 ====================
+def test_batch_output_plan_avoids_overwrite(tmp_path):
+    """同名不同扩展名必须各自成文，不能互相覆盖（实测会静默丢 2/3 转写稿）。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    names = ["采访.mp4", "采访.wav", "采访.m4a", "独一份.mp4"]
+    for n in names:
+        (src / n).write_bytes(b"x")
+
+    files = workers.scan_media_files(str(src))
+    w = workers.BatchTranscribeWorker(files, "m", str(tmp_path / "out"))
+    plan = w._plan_outputs()
+
+    assert len(plan) == len(files)
+    assert len(set(plan.values())) == len(files), "输出路径必须两两不同"
+    # 不重名的文件保持简洁命名（不给用户添乱）
+    solo = [p for p in files if os.path.basename(p) == "独一份.mp4"][0]
+    assert os.path.basename(plan[solo]) == "独一份_转写稿.txt"
+    # 重名的补上源扩展名
+    for p in files:
+        if os.path.basename(p) != "独一份.mp4":
+            assert os.path.basename(plan[p]) == "采访_%s_转写稿.txt" % p.rsplit(".", 1)[1]
+
+
+def test_batch_export_all_files_survive(tmp_path):
+    """端到端：批量导出后每份转写稿都落盘且内容对应各自的源文件。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    for n in ("采访.mp4", "采访.wav", "采访.m4a"):
+        (src / n).write_bytes(b"x")
+    files = workers.scan_media_files(str(src))
+    out = tmp_path / "out"
+    w = workers.BatchTranscribeWorker(files, "m", str(out))
+    plan = w._plan_outputs()
+
+    for f in files:
+        w._export(f, [{"start": 0.0, "end": 1.0, "text": os.path.basename(f)}], plan[f])
+
+    assert len(list(out.iterdir())) == len(files)
+    for f in files:
+        assert os.path.basename(f) in open(plan[f], encoding="utf-8").read()
+
+
+def test_batch_transcribe_writes_each_file(qapp, monkeypatch, tmp_path):
+    """走完整 run()：3 个同名不同扩展名的源文件应产出 3 份转写稿。"""
+    from PySide6.QtCore import Qt
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for n in ("采访.mp4", "采访.wav", "采访.m4a"):
+        (src / n).write_bytes(b"x")
+    files = workers.scan_media_files(str(src))
+    out = tmp_path / "out"
+
+    def _fake(media, model, **kw):
+        return ([{"start": 0.0, "end": 1.0, "text": os.path.basename(media)}], {})
+
+    monkeypatch.setattr(workers, "transcribe_media", _fake)
+    w = workers.BatchTranscribeWorker(files, "m", str(out))
+    done = []
+    w.finished_ok.connect(lambda a, b: done.append((a, b)), Qt.ConnectionType.DirectConnection)
+    w.start()
+    w.wait(5000)
+
+    assert done == [(3, 3)]
+    assert len(list(out.iterdir())) == 3
+
+
+def test_interrupted_download_leaves_no_model_file(isolated_settings, tmp_path, monkeypatch):
+    """中断的下载不得留下「文件名正常但内容残缺」的 model.bin。
+
+    否则模型会被判为「已下载」并出现在下拉列表中，用户选中后只得到
+    「Cannot load the target vocabulary from the model directory」这类无从下手的报错。
+    """
+    repo = "Systran/faster-whisper-large-v3"
+    full = b"z" * 5000
+    url = _url(repo, "model.bin")
+    isolated_settings.set_models_dir(str(tmp_path))
+    monkeypatch.setattr(model_manager, "get_model_files", lambda r: ["model.bin"])
+    monkeypatch.setattr(model_manager.time, "sleep", lambda s: None)
+
+    class _DroppingResp(_FakeResp):
+        def iter_content(self, chunk_size=1):
+            yield self._body[:2000]                 # 只落一半就断
+            raise requests.ConnectionError("reset")
+
+    class _Session(_FakeSession):
+        def get(self, url, headers=None, **kw):
+            body = self.contents.get(url, b"")
+            return _DroppingResp(200, {"content-length": str(len(body))}, body)
+
+    monkeypatch.setattr(model_manager.requests, "Session", lambda: _Session({url: full}))
+    with pytest.raises(requests.RequestException):
+        model_manager.download_model(repo)
+
+    d = model_manager.ModelInfo(repo).local_dir
+    assert os.path.exists(os.path.join(d, "model.bin.part"))     # 保留续传数据
+    assert not os.path.exists(os.path.join(d, "model.bin"))      # 关键：不得冒充完整
+    assert workers.local_model_kind(d) is None
+    assert model_manager.ModelInfo(repo).is_downloaded is False
+    assert workers.list_local_models(str(tmp_path), kind="fw") == []
+
+    # 再次下载 → 复用 .part 续传并完成
+    monkeypatch.setattr(model_manager.requests, "Session",
+                        lambda: _FakeSession({url: full}))
+    dest = model_manager.download_model(repo)
+    assert open(os.path.join(dest, "model.bin"), "rb").read() == full
+    assert not os.path.exists(os.path.join(dest, "model.bin.part"))
+
+
+def test_completed_download_has_no_part_leftover(isolated_settings, tmp_path, monkeypatch):
+    """正常完成的下载不留 .part 残留。"""
+    repo, full = "repo/m", b"content" * 500
+    url = _url(repo, "model.bin")
+    isolated_settings.set_models_dir(str(tmp_path))
+    monkeypatch.setattr(model_manager, "get_model_files", lambda r: ["model.bin"])
+    monkeypatch.setattr(model_manager.requests, "Session", lambda: _FakeSession({url: full}))
+    dest = model_manager.download_model(repo)
+    assert sorted(os.listdir(dest)) == ["model.bin"]
+
+
+def test_export_name_follows_batch_result(qapp, isolated_settings, tmp_path, monkeypatch):
+    """批量转写后，导出默认文件名应依据刚完成的结果，而不是先前拖入的文件。
+
+    回归：segments 来自批量最后一个文件，而命名却取自 self.media_path
+    （可能是用户很早之前拖入的另一个素材）→ 文件名与内容不符。
+    """
+    from app.main_window import MainWindow
+
+    w = MainWindow()
+    w.media_path = "/素材/用户早先拖入的A.mp4"          # 无关的旧素材
+    w._batch_total = 3
+
+    w._on_batch_file_finished(3, "/素材/批量目录/最后一个.mov", "/out/最后一个_转写稿.txt")
+    seen = {}
+    monkeypatch.setattr("app.main_window.QFileDialog.getSaveFileName",
+                        lambda *a, **k: (seen.setdefault("default", a[2]), ("", ""))[1])
+    w._save_path("srt", "SRT (*.srt)")
+    assert "最后一个_转写稿.srt" in seen["default"]
+    assert "用户早先拖入的A" not in seen["default"]
+    assert w._title().startswith("最后一个")
+
+
+# ==================== 第五轮：内存占用优化 ====================
+def _write_wav_nch(path, seconds=1.0, rate=16000, nch=1, freq=40.0, amp=8000):
+    """写多声道 WAV（用于验证立体声下混增益）。"""
+    import math
+    import struct
+    import wave
+
+    n = int(seconds * rate)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(nch)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        buf = bytearray()
+        for i in range(n):
+            v = int(amp * math.sin(i / freq))
+            for c in range(nch):
+                buf += struct.pack("<h", v // (c + 1))
+        w.writeframes(bytes(buf))
+    return str(path)
+
+
+def test_decode_audio_pyav_matches_reference_decoder(tmp_path):
+    """内置解码器必须与 faster-whisper 的 decode_audio **逐位一致**。
+
+    这是本轮内存优化的安全前提：CPU 路径改为把预解码的波形交给 faster-whisper，
+    只有逐位一致才能保证转写结果不发生任何变化。
+    覆盖单/双声道与多种源采样率——立体声下混的增益差异正是在这里暴露的。
+    """
+    import numpy as np
+    from faster_whisper.audio import decode_audio
+
+    cases = []
+    for rate in (8000, 16000, 22050, 44100, 48000):
+        for nch in (1, 2):
+            cases.append(_write_wav_nch(tmp_path / f"r{rate}c{nch}.wav",
+                                        seconds=1.0, rate=rate, nch=nch))
+    for path in cases:
+        got = workers.decode_audio_pyav(path)
+        ref = decode_audio(path, sampling_rate=16000)
+        assert got.shape == ref.shape, path
+        assert got.dtype == ref.dtype == np.float32
+        assert np.array_equal(got, ref), f"与参考解码器不一致: {path}"
+
+
+def test_decode_audio_pyav_downmix_has_no_3db_bias(tmp_path):
+    """立体声下混不得有 +3 dB 增益偏差（回归：flt 下混会推到削波）。
+
+    背景：FFmpeg 对整型做下混用 (L+R)/2，对浮点用 (L+R)/√2。用 flt 时实测
+    真实采访素材峰值 0.89 → 1.26，0.83% 样本被削波到 ±1.0。
+    """
+    import numpy as np
+
+    path = _write_wav_nch(tmp_path / "st.wav", seconds=0.5, rate=48000, nch=2, amp=8000)
+    audio = workers.decode_audio_pyav(path)
+    # 两声道同相且等幅 → 下混后应与单声道源同幅（约 8000/32768），而非高 3 dB
+    assert float(np.abs(audio).max()) < 0.30
+    assert not np.any(np.abs(audio) >= 1.0)
+
+
+def test_decode_audio_pyav_returns_standalone_buffer(tmp_path):
+    """返回值必须是独立、可写、连续的一维 float32 数组。
+
+    预分配缓冲若直接返回视图，会连同内部容量一起被持有（内存优化失效）；
+    下游（mlx / ctranslate2）也可能原地修改波形。
+    """
+    import numpy as np
+
+    path = _write_wav_nch(tmp_path / "a.wav", seconds=0.5)
+    audio = workers.decode_audio_pyav(path)
+    assert audio.ndim == 1
+    assert audio.flags.c_contiguous and audio.flags.writeable
+    assert audio.flags.owndata or audio.base is None
+    # 缓冲不应远大于实际数据（预分配后必须截断）
+    assert audio.size == 8000
+
+
+def test_decode_audio_pyav_handles_unknown_duration(tmp_path):
+    """时长元数据缺失时按需增长，不得崩溃或丢样本。"""
+    import numpy as np
+
+    path = _write_wav_nch(tmp_path / "b.wav", seconds=2.0)
+    assert workers._estimate_sample_count.__name__ == "_estimate_sample_count"
+    audio = workers.decode_audio_pyav(path)
+    assert abs(audio.size - 32000) <= 2
+
+    # 元数据不可用 → 估算为 0，走增长分支
+    class _NoDuration:
+        duration = None
+
+    class _Stream:
+        duration = None
+        time_base = None
+
+    assert workers._estimate_sample_count(_NoDuration(), _Stream(), 16000) == 0
+
+
+def test_decode_for_fw_falls_back_on_decode_error(monkeypatch):
+    """解码失败应回退为传路径（交由库报错），而不是让转写直接失败。
+
+    这样文件损坏/路径不存在时的错误文案与改动前完全一致。
+    """
+    def _boom(*a, **k):
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr(workers, "decode_audio_pyav", _boom)
+    assert workers._decode_for_fw("/whatever.mp4") is None
+
+
+def test_decode_for_fw_surfaces_no_audio_stream(monkeypatch):
+    """「无音频流」必须上抛：这是我们能给出更准确提示的情形。"""
+    def _no_stream(*a, **k):
+        raise workers.NoAudioStreamError("媒体文件中没有可用的音频流")
+
+    monkeypatch.setattr(workers, "decode_audio_pyav", _no_stream)
+    with pytest.raises(workers.NoAudioStreamError):
+        workers._decode_for_fw("/whatever.mp4")
+
+
+def test_decode_for_fw_returns_none_for_empty_audio(monkeypatch):
+    """空波形（0 采样点）交给库处理，避免下游 duration=0 的边界问题。"""
+    import numpy as np
+
+    monkeypatch.setattr(workers, "decode_audio_pyav",
+                        lambda *a, **k: np.zeros(0, dtype=np.float32))
+    assert workers._decode_for_fw("/whatever.mp4") is None
+
+
+def test_chunked_feature_extractor_matches_upstream(tmp_path):
+    """分块 STFT 必须与上游整段实现**逐位一致**。
+
+    这是本轮最大的内存热点（30 分钟素材多占 1.9 GB）。分块在数学上等价
+    （每帧 rfft 只依赖本帧的 400 点），但必须实测锁定。
+    短音频走上游原路径，同样要一致。
+    """
+    import numpy as np
+    from faster_whisper.feature_extractor import FeatureExtractor
+
+    rng = np.random.default_rng(0)
+    plain = FeatureExtractor(feature_size=80, sampling_rate=16000, chunk_length=30)
+    chunked = workers._get_chunked_feature_extractor()(
+        feature_size=80, sampling_rate=16000, hop_length=160, chunk_length=30, n_fft=400)
+    for seconds in (0.5, 5.0, 29.9, 30.0, 61.0):
+        wav = (rng.standard_normal(int(seconds * 16000)) * 0.2).astype(np.float32)
+        ref = plain(wav)
+        got = chunked(wav)
+        assert got.shape == ref.shape, seconds
+        assert np.array_equal(got, ref), f"分块特征提取与上游不一致: {seconds}s"
+
+
+def test_patch_feature_extractor_is_idempotent():
+    """重复打补丁不应层层包装（批量转写会复用同一个模型实例）。"""
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(str(__import__("pathlib").Path("models/Systran__faster-whisper-tiny")),
+                         device="cpu", compute_type="int8")
+    workers._patch_feature_extractor(model)
+    first = model.feature_extractor
+    assert isinstance(first, workers._get_chunked_feature_extractor())
+    workers._patch_feature_extractor(model)
+    assert model.feature_extractor is first
+
+
+def test_fw_path_passes_decoded_waveform(monkeypatch):
+    """CPU 路径应把预解码的波形交给 faster-whisper（而非文件路径）。"""
+    import sys
+    import types
+
+    import numpy as np
+
+    captured = {}
+
+    class _Model:
+        def __init__(self, path, device=None, compute_type=None, **kw):
+            pass
+
+        def transcribe(self, media, **kw):
+            captured["media"] = media
+            return ([], _FakeInfo())
+
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = _Model
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+    monkeypatch.setattr(workers, "decode_audio_pyav",
+                        lambda *a, **k: np.zeros(16000, dtype=np.float32))
+
+    workers.clear_model_cache()
+    workers.transcribe_media("/a.mp4", "/m", engine="cpu", language="zh")
+    assert isinstance(captured["media"], np.ndarray)
+    workers.clear_model_cache()

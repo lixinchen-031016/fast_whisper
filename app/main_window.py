@@ -36,6 +36,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FastWhisper · 语音转文字")
         self.resize(920, 720)
         self.media_path = ""
+        # 当前结果对应的素材路径（导出命名依据）。批量模式下逐文件更新，
+        # 与「用户最近拖入的 media_path」解耦，避免导出文件名与内容不符。
+        self._result_path = ""
         self.segments = []
         self.info = {}
         self.worker = None
@@ -461,6 +464,7 @@ class MainWindow(QMainWindow):
 
         self._clear_results()
         self._batch_total = 0
+        self._result_path = self.media_path      # 单文件：结果即当前素材
         self._set_busy(True)
         # mlx 一次性返回、无流式进度 → 保持不确定动画；其余显示真实百分比
         if self._engine_kind(engine) == "mlx":
@@ -547,6 +551,7 @@ class MainWindow(QMainWindow):
             f"[{idx}/{total}] 正在转写：{os.path.basename(path)}")
 
     def _on_batch_file_finished(self, idx, path, export_path):
+        self._result_path = path                 # 批量：结果来自刚完成的这个文件
         self.status_label.setText(f"✓ 已导出：{os.path.basename(export_path)}")
 
     def _on_batch_file_failed(self, idx, path, err):
@@ -656,8 +661,9 @@ class MainWindow(QMainWindow):
     def _save_path(self, ext: str, filter_text: str) -> str:
         # 默认导出位置：用户设置的导出目录优先，否则跟随媒体文件所在目录
         from . import settings
-        base = os.path.splitext(os.path.basename(self.media_path))[0]
-        default_dir = settings.get_export_dir() or (os.path.dirname(self.media_path) or ".")
+        source = self._result_path or self.media_path
+        base = os.path.splitext(os.path.basename(source))[0] or "语音转写稿"
+        default_dir = settings.get_export_dir() or (os.path.dirname(source) or ".")
         default = os.path.join(default_dir, f"{base}_转写稿.{ext}")
         path, _ = QFileDialog.getSaveFileName(self, "导出", default, filter_text)
         # 用户未填扩展名时按当前格式自动补全
@@ -700,7 +706,8 @@ class MainWindow(QMainWindow):
             self._run_export(lambda: export_docx(self.segments, path, self._title()))
 
     def _title(self) -> str:
-        base = os.path.splitext(os.path.basename(self.media_path))[0] if self.media_path else "语音转写稿"
+        source = self._result_path or self.media_path
+        base = os.path.splitext(os.path.basename(source))[0] if source else "语音转写稿"
         return f"{base} 语音转写稿"
 
     def _export_done(self, path: str):

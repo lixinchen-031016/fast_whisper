@@ -26,6 +26,12 @@ GET_RETRIES = 3          # 元信息/搜索请求失败重试次数（网络抖�
 # 对用户代价太高；续传机制使重试成本极低（只补缺失部分），故默认重试 3 次。
 FILE_RETRIES = 3
 
+# 未完成文件的临时后缀。下载先写 <name>.part，全部字节校验通过后再原子改名为
+# 正式文件名。否则中断（取消/断网/崩溃/磁盘满）会留下一个**残缺但文件名正常**的
+# model.bin，被「已下载」判定采信，用户选中后只得到
+# 「Cannot load the target vocabulary from the model directory」这类无从下手的报错。
+PART_SUFFIX = ".part"
+
 # 并行下载并发数：模型仓库通常含多个文件（权重 + config/vocab 等小文件），
 # 适度并发可显著缩短总耗时；过高可能触发镜像站限流，默认 4。
 MAX_DOWNLOAD_WORKERS = 4
@@ -203,13 +209,26 @@ def _download_file_once(repo_id: str, filename: str, dest_dir: str,
     - 服务器忽略 Range 返回 200 → 截断重下（避免进度超 100%）
     - 返回 416（断点位置越界）→ 本地已完整则跳过，异常则删除重下
     - 下载完成后校验文件大小与远端一致，不符则报错
+    - 在写的文件始终是 `.part`，校验通过后才原子改名为正式文件，保证磁盘上
+      「存在 model.bin」等价于「该文件已完整下载」
     """
-    dest_path = os.path.join(dest_dir, filename)
-    parent = os.path.dirname(dest_path)
+    final_path = os.path.join(dest_dir, filename)
+    part_path = final_path + PART_SUFFIX
+    parent = os.path.dirname(final_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     url = f"{HF_MIRROR}/{repo_id}/resolve/main/{filename}"
-    local_size = os.path.getsize(dest_path) if os.path.isfile(dest_path) else 0
+
+    # 续传源（同时也是写入目标）的优先级：
+    #   1) 有 .part          → 继续写这个中断的下载
+    #   2) 只有最终文件      → 沿用历史行为（可能已完整，靠 416 判定后跳过）
+    #   3) 都没有            → 新建 .part
+    if os.path.isfile(part_path):
+        dest_path, local_size = part_path, os.path.getsize(part_path)
+    elif os.path.isfile(final_path):
+        dest_path, local_size = final_path, os.path.getsize(final_path)
+    else:
+        dest_path, local_size = part_path, 0
     headers = {"Range": f"bytes={local_size}-"} if local_size > 0 else {}
 
     session = requests.Session()
@@ -256,6 +275,10 @@ def _download_file_once(repo_id: str, filename: str, dest_dir: str,
             raise IOError(
                 f"下载校验失败：{filename} 期望 {total} 字节，"
                 f"实际 {os.path.getsize(dest_path)} 字节（可重试续传）")
+
+        # 校验通过才落成正式文件名：中途任何失败都不会留下「看似完整」的模型
+        if dest_path == part_path:
+            os.replace(part_path, final_path)
     finally:
         session.close()
 
