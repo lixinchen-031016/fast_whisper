@@ -8,7 +8,7 @@ import os
 import pytest
 import requests
 
-from app import model_manager, settings, workers
+from app import homophone, model_manager, settings, workers
 from app.config import HF_MIRROR
 
 
@@ -774,7 +774,8 @@ def test_batch_worker_reports_whole_batch_progress(qapp, monkeypatch, tmp_path):
 
     def _fake_transcribe(media, model, engine="cpu", language="auto", task="transcribe",
                          beam_size=5, use_vad=True, batched=False, on_segment=None,
-                         on_status=None, on_progress=None, cancel_check=None, terms=""):
+                         on_status=None, on_progress=None, cancel_check=None, terms="",
+                         fix_homophones=True):
         for pct in (25, 50, 100):
             if on_progress:
                 on_progress(pct)
@@ -1187,3 +1188,242 @@ def test_terms_passed_from_ui_to_worker(qapp, isolated_settings, tmp_path, monke
     monkeypatch.setattr("app.main_window.TranscribeWorker", _Spy)
     w.start_transcribe()
     assert seen["terms"] == "成都工业学院"
+
+
+# ==================== 第六轮：近音词确定性纠正（app/homophone.py） ====================
+@pytest.mark.skipif(not homophone.available(), reason="未安装 pypinyin")
+class TestHomophone:
+    """语料全部取自 /Users/lixinchen/Movies/采访视频 人工整备稿记录的错别字。"""
+
+    TERMS = ["成都工业学院", "德国管理应用技术大学", "数字媒体技术", "中外合作办学",
+             "生源质量优异", "水浒传", "一百单八将", "系统引进", "舒心", "中外老师"]
+
+    @pytest.fixture()
+    def fix(self):
+        f = homophone.make_fixer(self.TERMS)
+        assert f is not None
+        return f
+
+    # ----- 召回：人工整备稿确认过的真实错别字 -----
+    @pytest.mark.parametrize("raw,expected", [
+        ("声援质量优异，最终108名新生顺利报到", "生源质量优异"),
+        ("联想到了《水湖传》中的一百丹八将", "水浒传"),
+        ("联想到了《水湖传》中的一百丹八将", "一百单八将"),
+        ("校园环境疏心，中外老师认真负责", "舒心"),
+        ("校园环境疏心，众外老师认真负责", "中外老师"),
+    ])
+    def test_fixes_real_mishearings(self, fix, raw, expected):
+        out, spans = fix(raw)
+        assert expected in out
+        assert spans
+
+    def test_multiple_fixes_in_one_segment(self, fix):
+        out, spans = fix("《水湖传》中的一百丹八将")
+        assert out == "《水浒传》中的一百单八将"
+        assert len(spans) == 2
+
+    # ----- 精确度：不得误伤 -----
+    @pytest.mark.parametrize("text", [
+        "自己的国际化事业当中去提升自己",   # 的/德 同音：2 字子串曾误修成「德国」
+        "计数器与计数器之间的差异",         # 计数/技术 同音：曾误修成「技术」
+        "成都工业大学",                     # 与术语近形但异音 → 拼音不同，不该改
+        "学生的数字媒体技术专业",           # 术语本身，无需改动
+        "",
+    ])
+    def test_no_false_positives(self, fix, text):
+        out, spans = fix(text)
+        assert out == text and spans == []
+
+    def test_term_absence_means_no_change(self):
+        """术语表里没有的词绝不能被"凭空"改写（防止索引污染）。"""
+        f = homophone.make_fixer(["成都工业学院", "水浒传"])
+        out, spans = f("《水湖传》中的一百丹八将")
+        assert out == "《水浒传》中的一百丹八将"      # 只修术语表里有的那个
+        assert len(spans) == 1
+
+    def test_replacement_is_length_preserving(self, fix):
+        """替换必须等长——这是「改字不动时间轴」的前提。"""
+        for raw in ("声援质量优异", "《水湖传》中的一百丹八将", "校园环境疏心，众外老师"):
+            _out, spans = fix(raw)
+            for start, end, orig, canon in spans:
+                assert len(orig) == len(canon) == end - start
+
+    # ----- 安全阈值：短术语只认整词 -----
+    def test_short_terms_match_whole_word_only(self):
+        """2 字术语不做子串扩张，避免 2 字子串撞车常见词。"""
+        f = homophone.make_fixer(["舒心"])
+        assert f("校园环境疏心")[0] == "校园环境舒心"
+        assert f("舒服的心情")[0] == "舒服的心情"      # 舒心 的子串「舒」不扩张
+
+    def test_long_term_substrings_allow_inner_errors(self):
+        """长术语内部还有别的错时，其子串匹配仍能救回一部分。
+
+        真实案例：「声援质量优质」中除了 声援→生源，末尾 优质→优异 也错了。
+        按整词匹配会因末字不同而整体失配；子串机制让前 4 字仍被救回。
+        """
+        f = homophone.make_fixer(["生源质量优异"])
+        out, spans = f("声源质量优质")
+        assert out.startswith("生源质量")
+        assert spans
+
+    def test_deletion_and_insertion_are_not_fixable(self):
+        """明确的边界：缺字/多字（插入删除类）不做处理，避免误伤。
+
+        「德国管理用技术大学」少一个「应」、「迎接来」多一个「接」——
+        这类需要对齐算法，确定性替换无能为力，也不该硬猜。
+        """
+        f = homophone.make_fixer(["德国管理应用技术大学", "迎来"])
+        for text in ("德国管理用技术大学", "今年项目刚好迎接来108名新生"):
+            assert f(text)[0] == text
+
+    def test_unknown_or_empty_terms(self):
+        assert homophone.make_fixer([]) is None
+        assert homophone.make_fixer(["  ", ""]) is None
+        assert homophone.make_fixer(None) is None
+
+    def test_split_terms_mixed_separators(self):
+        assert homophone.split_terms("A,B、C;D\nE") == ["A", "B", "C", "D", "E"]
+        assert homophone.split_terms("") == []
+
+    def test_correct_segments_in_place(self):
+        segs = [{"start": 0.0, "end": 1.0, "text": "声援质量优异"},
+                {"start": 1.0, "end": 2.0, "text": "无关内容"}]
+        assert homophone.correct_segments(segs, self.TERMS) == 1
+        assert segs[0]["text"] == "生源质量优异"
+        assert segs[1]["text"] == "无关内容"
+        assert segs[0]["start"] == 0.0          # 时间轴不动
+
+
+# ==================== 第六轮：纠错接入转写核心 ====================
+def test_worker_applies_homophone_fix_to_segments(monkeypatch):
+    """转写核心应逐段纠错，且 info 里报告改动处数。"""
+    import sys
+    import types
+
+    workers.clear_model_cache()
+
+    class _Model:
+        def __init__(self, path, device=None, compute_type=None, **kw):
+            pass
+
+        def transcribe(self, media, **kw):
+            return ([_FakeSeg(0.0, 1.0, " 声援质量优异 ")], _FakeInfo())
+
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = _Model
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+
+    segs, info = workers.transcribe_media("/a.mp3", "/m", engine="cpu", language="zh",
+                                          terms="生源质量优异")
+    assert segs[0]["text"] == "生源质量优异"
+    assert info["homophone_fixes"] == 1
+
+    # 关掉开关 → 原样保留
+    segs2, info2 = workers.transcribe_media("/a.mp3", "/m", engine="cpu", language="zh",
+                                            terms="生源质量优异", fix_homophones=False)
+    assert segs2[0]["text"] == "声援质量优异"
+    assert info2["homophone_fixes"] == 0
+    workers.clear_model_cache()
+
+
+def test_homophone_fix_reaches_mlx_path(monkeypatch):
+    import sys
+    import types
+
+    import numpy as np
+
+    def _fake(audio, **kw):
+        return {"segments": [{"start": 0.0, "end": 1.0, "text": "《水湖传》中的一百丹八将"}],
+                "language": "zh"}
+
+    mx = types.ModuleType("mlx_whisper")
+    mx.transcribe = _fake
+    monkeypatch.setitem(sys.modules, "mlx_whisper", mx)
+    monkeypatch.setattr(workers, "decode_audio_pyav",
+                        lambda *a, **k: np.zeros(16000, dtype="float32"))
+
+    seen = []
+    segs, info = workers.transcribe_media(
+        "/a.mp3", "/m", engine="mlx", language="zh",
+        terms="水浒传、一百单八将",
+        on_segment=lambda s, e, t: seen.append(t))
+    assert segs[0]["text"] == "《水浒传》中的一百单八将"
+    assert info["homophone_fixes"] == 2
+    assert seen == ["《水浒传》中的一百单八将"]     # 回调里已是纠正后的文本
+
+
+def test_homophone_checkbox_persists_and_reaches_worker(qapp, isolated_settings,
+                                                        tmp_path, monkeypatch):
+    """界面开关：默认开启、可持久化、并真正传给工作线程。"""
+    from app.main_window import MainWindow
+
+    isolated_settings.set_models_dir(str(tmp_path))
+    media = tmp_path / "a.mp3"
+    media.write_bytes(b"x")
+
+    w = MainWindow()
+    assert w.homophone_check.isChecked() is True          # 默认开
+    w.homophone_check.setChecked(False)
+    w._save_prefs()
+    assert MainWindow().homophone_check.isChecked() is False   # 持久化
+
+    w = MainWindow()
+    w.terms_edit.setText("成都工业学院")
+    w._on_file_chosen(str(media))
+    monkeypatch.setattr(w, "_preflight", lambda: ("/tmp/model", "cpu"))
+
+    seen = {}
+
+    class _Sig:
+        def connect(self, *a, **k):
+            pass
+
+    class _Spy:
+        progress_text = _Sig(); progress_pct = _Sig(); segment_ready = _Sig()
+        finished_ok = _Sig(); failed = _Sig()
+
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("app.main_window.TranscribeWorker", _Spy)
+    w.homophone_check.setChecked(True)
+    w.start_transcribe()
+    assert seen["fix_homophones"] is True
+
+
+def test_mlx_import_error_distinguishes_missing_package_from_no_metal(monkeypatch):
+    """Metal 设备缺失与包未安装要给不同提示——前者重装也没用。
+
+    回归：无头/沙箱 macOS 上 `import mlx_whisper` 会抛
+    "No Metal device available"，原实现一律提示「缺少 mlx-whisper」，误导用户。
+    """
+    import builtins
+    import sys
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *a, **k):
+        if name == "mlx_whisper":
+            raise ImportError("[metal::load_device] No Metal device available.")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    monkeypatch.delitem(sys.modules, "mlx_whisper", raising=False)
+    with pytest.raises(RuntimeError) as ei:
+        workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="zh")
+    assert "Metal GPU 当前不可用" in str(ei.value)
+    assert "缺少 mlx-whisper" not in str(ei.value)
+
+    def _no_pkg(name, *a, **k):
+        if name == "mlx_whisper":
+            raise ImportError("No module named 'mlx_whisper'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_pkg)
+    with pytest.raises(RuntimeError) as ei2:
+        workers.transcribe_media("/a.mp3", "/m", engine="mlx", language="zh")
+    assert "缺少 mlx-whisper" in str(ei2.value)
+    assert "pip install mlx-whisper" in str(ei2.value)

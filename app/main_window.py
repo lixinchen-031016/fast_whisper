@@ -159,6 +159,15 @@ class MainWindow(QMainWindow):
             "首次转写某类素材时填入一次，之后会自动记住。")
         grid.addWidget(self.terms_edit, 4, 1, 1, 3)
 
+        self.homophone_check = QCheckBox("按术语表纠正近音词")
+        self.homophone_check.setChecked(True)
+        self.homophone_check.setToolTip(
+            "提示词是概率手段，同一段音频里可能只修好一部分（实测「德国管理应用技术大学」\n"
+            "修好了、「生源质量」仍错成「声源质量」）。勾选后用拼音比对把剩余的同音错别字\n"
+            "确定性改回术语表写法（仅当拼音完全一致才替换，不会误伤近形异音的词）。\n"
+            "需要上面填写术语表；未安装 pypinyin 时本项自动失效。")
+        grid.addWidget(self.homophone_check, 5, 1, 1, 3)
+
         card2.layout().addLayout(grid)
         root.addWidget(card2)
 
@@ -372,6 +381,7 @@ class MainWindow(QMainWindow):
         self.vad_check.setChecked(settings.get_ui("vad", "1") == "1")
         self.batched_check.setChecked(settings.get_ui("batched", "0") == "1")
         self.terms_edit.setText(settings.get_ui("terms", ""))
+        self.homophone_check.setChecked(settings.get_ui("homophone", "1") == "1")
 
     def _save_prefs(self):
         """保存当前界面偏好，下次启动自动恢复。"""
@@ -383,6 +393,7 @@ class MainWindow(QMainWindow):
         settings.set_ui("vad", "1" if self.vad_check.isChecked() else "0")
         settings.set_ui("batched", "1" if self.batched_check.isChecked() else "0")
         settings.set_ui("terms", self.terms_edit.text().strip())
+        settings.set_ui("homophone", "1" if self.homophone_check.isChecked() else "0")
 
     # ================= 转写 =================
     def _preflight(self):
@@ -471,6 +482,7 @@ class MainWindow(QMainWindow):
             batched=(self._engine_kind(engine) == "fw"
                      and self.batched_check.isChecked()),
             terms=self.terms_edit.text().strip(),
+            fix_homophones=self.homophone_check.isChecked(),
         )
         self.worker.progress_text.connect(self.status_label.setText)
         self.worker.progress_pct.connect(self.progress.setValue)
@@ -518,6 +530,7 @@ class MainWindow(QMainWindow):
             batched=(self._engine_kind(engine) == "fw"
                      and self.batched_check.isChecked()),
             terms=self.terms_edit.text().strip(),
+            fix_homophones=self.homophone_check.isChecked(),
         )
         self.batch_worker.file_started.connect(self._on_batch_file_started)
         self.batch_worker.segment_ready.connect(self._on_segment)
@@ -602,8 +615,10 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         dur = self.info.get("duration", 0)
         lang = self.info.get("language", "?")
+        fixes = int(self.info.get("homophone_fixes", 0) or 0)
         self.status_label.setText(
-            f"转写完成：共 {len(segments)} 段 · 音频时长 {dur / 60:.1f} 分钟 · 识别语言 {lang}")
+            f"转写完成：共 {len(segments)} 段 · 音频时长 {dur / 60:.1f} 分钟 · 识别语言 {lang}"
+            + (f" · 已按术语表纠正 {fixes} 处近音词" if fixes else ""))
         self.plain_text.setPlainText("\n".join(s["text"] for s in segments))
         self._set_export_enabled(bool(segments))
 

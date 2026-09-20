@@ -6,14 +6,13 @@
 批量（BatchTranscribeWorker）复用同一实现，也便于脱离 GUI 做单元测试。
 """
 import os
-import re
 import sys
 import threading
 import traceback
 
 from PySide6.QtCore import QThread, Signal
 
-from . import model_manager, settings
+from . import homophone, model_manager, settings
 from .model_manager import CancelledError
 
 
@@ -131,8 +130,9 @@ def _terms_prompt(language, terms) -> str:
     terms = (terms or "").strip() if isinstance(terms, str) else ""
     if not terms:
         return base
-    # 术语表里逗号/顿号/换行混用都可能，统一成中文顿号，避免模型照抄分隔符
-    flat = "、".join(t.strip() for t in re.split(r"[,，、\n;；]+", terms) if t.strip())
+    # 术语表里逗号/顿号/换行混用都可能，统一成中文顿号，避免模型照抄分隔符。
+    # 拆分口径与近音词纠正共用 homophone.split_terms，避免两处规则漂移。
+    flat = "、".join(homophone.split_terms(terms))
     flat = flat[:TERM_PROMPT_MAX_CHARS]
     hint = f"专业术语（请按此写法输出）：{flat}。"
     return f"{base}{hint}" if base else hint
@@ -214,7 +214,7 @@ def _pct_reporter(on_progress, duration: float):
 def transcribe_media(media_path: str, model_path: str, engine: str = "cpu",
                      language="auto", task: str = "transcribe",
                      beam_size: int = 5, use_vad: bool = True, batched: bool = False,
-                     terms: str = "",
+                     terms: str = "", fix_homophones: bool = True,
                      on_segment=None, on_status=None, on_progress=None,
                      cancel_check=None):
     """执行一次转写，返回 (segments, info)。
@@ -225,6 +225,10 @@ def transcribe_media(media_path: str, model_path: str, engine: str = "cpu",
     cancel_check() -> bool      —— 返回 True 时中止并抛出 CancelledError。
     terms                       —— 用户术语表（专有名词），并进 initial_prompt；
                                    实测能把「德国管理应用技术大学」等错识别纠正回来。
+    fix_homophones              —— 是否按术语表做近音词确定性校正。提示词是概率手段，
+                                   同一段音频里可能只修好一部分（实测「德国管理应用技术
+                                   大学」修好了、「生源质量」仍错），该层用拼音比对把
+                                   剩余的同音错别字确定性改回（见 app/homophone.py）。
     beam_size                   —— CPU/CUDA 下即 beam；Metal 下映射为温度策略
                                    （mlx 未实现 beam search，见 _temperatures_for_beam）。
     engine: "cpu" / "cuda"（faster-whisper）/ "mlx"（mlx-whisper，仅 macOS）。
@@ -232,19 +236,21 @@ def transcribe_media(media_path: str, model_path: str, engine: str = "cpu",
     """
     lang = None if language in (None, "auto", "") else language
     prompt = _terms_prompt(lang, terms)
+    # 纠错器只构造一次（索引构建是主要开销），逐段复用
+    fixer = homophone.make_fixer(homophone.split_terms(terms)) if fix_homophones else None
     if engine == "mlx":
         return _transcribe_mlx(media_path, model_path, lang, task, beam_size, use_vad,
-                               prompt,
+                               prompt, fixer,
                                on_segment, on_status, on_progress, cancel_check)
     return _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
-                          use_vad, batched, prompt,
+                          use_vad, batched, prompt, fixer,
                           on_segment, on_status, on_progress,
                           cancel_check)
 
 
 def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
-                   use_vad, batched, prompt, on_segment, on_status, on_progress,
-                   cancel_check):
+                   use_vad, batched, prompt, fixer, on_segment, on_status,
+                   on_progress, cancel_check):
     """faster-whisper 路径（CPU / NVIDIA CUDA）。"""
     from .config import ENGINES
     try:
@@ -305,11 +311,15 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
 
     # 用 info.duration 与已处理段落的 end 估算进度（percent 去重后回调）
     report = _pct_reporter(on_progress, float(getattr(info, "duration", 0) or 0))
-    segs = []
+    segs, fixes = [], 0
     for seg in segments:
         if cancel_check and cancel_check():
             raise CancelledError()
         text = seg.text.strip()
+        # 逐段纠错（而非等全部转完再改）：界面是流式出字的，用户看到的就已纠正
+        if fixer:
+            text, spans = fixer(text)
+            fixes += len(spans)
         segs.append({"start": seg.start, "end": seg.end, "text": text})
         if on_segment:
             on_segment(seg.start, seg.end, text)
@@ -320,6 +330,7 @@ def _transcribe_fw(media_path, model_path, engine, lang, task, beam_size,
         "language": info.language,
         "language_probability": round(info.language_probability, 3),
         "engine": engine,
+        "homophone_fixes": fixes,
     }
     return segs, info_obj
 
@@ -367,7 +378,7 @@ def _speech_clip_timestamps(audio, min_silence_ms: int = 500):
 
 
 def _transcribe_mlx(media_path, model_path, lang, task, beam_size, use_vad,
-                    prompt, on_segment, on_status, on_progress, cancel_check):
+                    prompt, fixer, on_segment, on_status, on_progress, cancel_check):
     """mlx-whisper 路径（Apple Metal GPU）。
 
     - 音频解码走内置 PyAV（规避 mlx 对系统 ffmpeg 命令行的依赖）
@@ -379,7 +390,20 @@ def _transcribe_mlx(media_path, model_path, lang, task, beam_size, use_vad,
     try:
         import mlx_whisper
     except ImportError as e:
-        raise RuntimeError(f"缺少 mlx-whisper（Metal 引擎）：{e}")
+        # 区分两种完全不同的成因：包没装，vs 装了但当前会话拿不到 Metal 设备
+        # （无头/沙箱/虚拟化的 macOS 上 GPU 不可见——此时提示"缺少 mlx-whisper"
+        # 是误导，用户重装也没用）。与「无音频流」那次修正是同一类问题。
+        low = str(e).lower()
+        if "metal" in low or "load_device" in low:
+            raise RuntimeError(
+                "Metal GPU 当前不可用（未获取到 Metal 设备）。\n"
+                "常见于无显示器/沙箱/虚拟化的 macOS 会话，或远程登录环境。\n"
+                "请在正常桌面会话中运行，或改用 CPU / NVIDIA 引擎。\n"
+                f"详细信息：{e}")
+        raise RuntimeError(
+            "缺少 mlx-whisper（Metal 引擎）。\n"
+            "安装命令：.venv/bin/pip install mlx-whisper\n"
+            f"详细信息：{e}")
 
     # 优先用内置 PyAV 解码为波形传入，避免依赖系统 ffmpeg 可执行文件
     # （mlx_whisper 传文件路径时会 subprocess 调用 `ffmpeg`，打包后常缺失）
@@ -427,8 +451,13 @@ def _transcribe_mlx(media_path, model_path, lang, task, beam_size, use_vad,
     if cancel_check and cancel_check():
         raise CancelledError()
 
-    segs = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()}
-            for s in result.get("segments", [])]
+    segs, fixes = [], 0
+    for s in result.get("segments", []):
+        text = s["text"].strip()
+        if fixer:
+            text, spans = fixer(text)
+            fixes += len(spans)
+        segs.append({"start": s["start"], "end": s["end"], "text": text})
     for s in segs:
         if on_segment:
             on_segment(s["start"], s["end"], s["text"])
@@ -440,6 +469,7 @@ def _transcribe_mlx(media_path, model_path, lang, task, beam_size, use_vad,
         "language": result.get("language", "?"),
         "language_probability": 0,
         "engine": "mlx",
+        "homophone_fixes": fixes,
     }
     return segs, info_obj
 
@@ -489,7 +519,8 @@ class TranscribeWorker(RetainedThread):
                  engine: str = "cpu",
                  language: str = "auto", task: str = "transcribe",
                  beam_size: int = 5, use_vad: bool = True,
-                 batched: bool = False, terms: str = "", parent=None):
+                 batched: bool = False, terms: str = "",
+                 fix_homophones: bool = True, parent=None):
         super().__init__(parent)
         self.media_path = media_path
         self.model_path = model_path
@@ -500,6 +531,7 @@ class TranscribeWorker(RetainedThread):
         self.use_vad = use_vad
         self.batched = batched
         self.terms = terms
+        self.fix_homophones = fix_homophones
         self._cancelled = False
 
     def cancel(self):
@@ -512,6 +544,7 @@ class TranscribeWorker(RetainedThread):
                 self.media_path, self.model_path, engine=self.engine,
                 language=self.language, task=self.task, beam_size=self.beam_size,
                 use_vad=self.use_vad, batched=self.batched, terms=self.terms,
+                fix_homophones=self.fix_homophones,
                 on_segment=lambda s, e, t: self.segment_ready.emit(s, e, t),
                 on_status=lambda m: self.progress_text.emit(m),
                 on_progress=lambda p: self.progress_pct.emit(p),
@@ -548,7 +581,7 @@ class BatchTranscribeWorker(RetainedThread):
                  engine: str = "cpu", language: str = "auto",
                  task: str = "transcribe", beam_size: int = 5,
                  use_vad: bool = True, batched: bool = False, terms: str = "",
-                 parent=None):
+                 fix_homophones: bool = True, parent=None):
         super().__init__(parent)
         self.media_files = list(media_files)
         self.model_path = model_path
@@ -560,6 +593,7 @@ class BatchTranscribeWorker(RetainedThread):
         self.use_vad = use_vad
         self.batched = batched
         self.terms = terms
+        self.fix_homophones = fix_homophones
         self._cancelled = False
 
     def cancel(self):
@@ -583,6 +617,7 @@ class BatchTranscribeWorker(RetainedThread):
                     path, self.model_path, engine=self.engine,
                     language=self.language, task=self.task, beam_size=self.beam_size,
                     use_vad=self.use_vad, batched=self.batched, terms=self.terms,
+                    fix_homophones=self.fix_homophones,
                     on_segment=lambda s, e, t: self.segment_ready.emit(s, e, t),
                     on_status=lambda m: self.progress_text.emit(m),
                     on_progress=_on_pct,
